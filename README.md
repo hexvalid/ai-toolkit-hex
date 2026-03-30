@@ -13,7 +13,7 @@ This README only covers macOS on Apple Silicon.
 ## What Is Different
 
 - Local training is meant to run on Apple Silicon with MPS.
-- Preview sampling is remote, not local in-process generation.
+- Preview sampling is remote, never local in-process generation.
 - Preview sampling is configured through `sample.drawthings`.
 - The remote sample model can be different from the model you are training on your Mac.
 - Returned previews are saved by AI Toolkit, not into the Draw Things gallery on the remote machine.

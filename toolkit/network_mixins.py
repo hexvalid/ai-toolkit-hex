@@ -119,10 +119,10 @@ class ExtractableModuleMixin:
         if extract_mode == "existing":
             extract_mode = 'fixed'
             extract_mode_param = self.lora_dim
-            
+
         if isinstance(weight_to_extract, QBytesTensor):
             weight_to_extract = weight_to_extract.dequantize()
-        
+
         weight_to_extract = weight_to_extract.clone().detach().float()
 
         if self.org_module[0].__class__.__name__ in CONV_MODULES:
@@ -226,9 +226,9 @@ class ToolkitModuleMixin:
         network: Network = self.network_ref()
         if not network.is_active:
             return self.org_forward(x, *args, **kwargs)
-        
+
         orig_dtype = x.dtype
-        
+
         if x.dtype != self.lora_down.weight.dtype:
             x = x.to(self.lora_down.weight.dtype)
 
@@ -281,7 +281,7 @@ class ToolkitModuleMixin:
         # if self.__class__.__name__ == "DoRAModule":
         #     # return dora forward
         #     return self.dora_forward(x, *args, **kwargs)
-        
+
         if self.__class__.__name__ == "LokrModule":
             return self._call_forward(x)
 
@@ -405,6 +405,15 @@ class ToolkitModuleMixin:
         org_sd[weight_key] = weight.to(weight_device, orig_dtype)
         self.org_module[0].load_state_dict(org_sd)
 
+    def reset_weights(self: Module):
+        # reset the weights to zero
+        org_sd = self.state_dict()
+        for key in org_sd.keys():
+            # only reset lora up
+            if 'lora_up' in key:
+                org_sd[key] = torch.zeros_like(org_sd[key])
+        self.load_state_dict(org_sd)
+
     def setup_lorm(self: Module, state_dict: Optional[Dict[str, Any]] = None):
         # LoRM (Low Rank Middle) is a method reduce the number of parameters in a module while keeping the inputs and
         # outputs the same. It is basically a LoRA but with the original module removed
@@ -512,7 +521,7 @@ class ToolkitNetworkMixin:
                 keymap = new_keymap
 
         return keymap
-    
+
     def get_state_dict(self: Network, extra_state_dict=None, dtype=torch.float16):
         keymap = self.get_keymap()
 
@@ -557,8 +566,8 @@ class ToolkitNetworkMixin:
                 new_save_dict[new_key] = value
 
             save_dict = new_save_dict
-        
-                
+
+
         if self.network_type.lower() == "lokr" and self.use_old_lokr_format:
             new_save_dict = {}
             for key, value in save_dict.items():
@@ -568,7 +577,7 @@ class ToolkitNetworkMixin:
                 new_save_dict[new_key] = value
 
             save_dict = new_save_dict
-        
+
         if self.base_model_ref is not None:
             save_dict = self.base_model_ref().convert_lora_weights_before_save(save_dict)
         return save_dict
@@ -580,7 +589,7 @@ class ToolkitNetworkMixin:
             extra_state_dict: Optional[OrderedDict] = None
     ):
         save_dict = self.get_state_dict(extra_state_dict=extra_state_dict, dtype=dtype)
-        
+
         if metadata is not None and len(metadata) == 0:
             metadata = None
 
@@ -588,12 +597,12 @@ class ToolkitNetworkMixin:
             metadata = OrderedDict()
         metadata = add_model_hash_to_meta(save_dict, metadata)
         # let the model handle the saving
-        
+
         if self.base_model_ref is not None and hasattr(self.base_model_ref(), 'save_lora'):
             # call the base model save lora method
             self.base_model_ref().save_lora(save_dict, file, metadata)
             return
-        
+
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import save_file
             save_file(save_dict, file, metadata)
@@ -618,7 +627,7 @@ class ToolkitNetworkMixin:
         else:
             # probably a state dict
             weights_sd = file
-        
+
         if self.base_model_ref is not None:
             weights_sd = self.base_model_ref().convert_lora_weights_before_load(weights_sd)
 
@@ -641,14 +650,14 @@ class ToolkitNetworkMixin:
                 load_key = load_key.replace('.', '$$')
                 load_key = load_key.replace('$$lora_down$$', '.lora_down.')
                 load_key = load_key.replace('$$lora_up$$', '.lora_up.')
-                
+
                 # patch lokr, not sure why we need to but whatever
                 if self.network_type.lower() == "lokr":
                     load_key = load_key.replace('$$lokr_w1', '.lokr_w1')
                     load_key = load_key.replace('$$lokr_w2', '.lokr_w2')
                     if load_key.endswith('$$alpha'):
                         load_key = load_key[:-7] + '.alpha'
-            
+
             if self.network_type.lower() == "lokr":
                 # lora_transformer_transformer_blocks_7_attn_to_v.lokr_w1 to lycoris_transformer_blocks_7_attn_to_v.lokr_w1
                 load_key = load_key.replace('lycoris_', 'lora_transformer_')
@@ -727,7 +736,7 @@ class ToolkitNetworkMixin:
             first_module = self.get_all_modules()[0]
         except IndexError:
             raise ValueError("There are not any lora modules in this network. Check your config and try again")
-        
+
         if hasattr(first_module, 'lora_down'):
             device = first_module.lora_down.weight.device
             dtype = first_module.lora_down.weight.dtype
@@ -811,6 +820,10 @@ class ToolkitNetworkMixin:
         # not supported
         self.is_checkpointing = False
         self._update_checkpointing()
+
+    def reset_weights(self: Network):
+        for module in self.get_all_modules():
+            module.reset_weights()
 
     def merge_in(self, merge_weight=1.0):
         if self.network_type.lower() == 'dora':

@@ -165,10 +165,10 @@ class QwenImageEditPlusModel(QwenImageModel):
         # todo handle not caching text encoder
         if self.pipeline.text_encoder.device != self.device_torch:
             self.pipeline.text_encoder.to(self.device_torch)
-            
+
         if control_images is None:
             raise ValueError("Missing control images for QwenImageEditPlusModel")
-        
+
         if not isinstance(control_images, List):
             control_images = [control_images]
 
@@ -176,8 +176,8 @@ class QwenImageEditPlusModel(QwenImageModel):
             for i in range(len(control_images)):
                 # control images are 0 - 1 scale, shape (bs, ch, height, width)
                 ratio = control_images[i].shape[2] / control_images[i].shape[3]
-                width = math.sqrt(CONDITION_IMAGE_SIZE * ratio)
-                height = width / ratio
+                height = math.sqrt(CONDITION_IMAGE_SIZE * ratio)
+                width = height / ratio
 
                 width = round(width / 32) * 32
                 height = round(height / 32) * 32
@@ -192,6 +192,11 @@ class QwenImageEditPlusModel(QwenImageModel):
             device=self.device_torch,
             num_images_per_prompt=1,
         )
+        # diffusers >=0.37 returns None when all tokens are valid (no padding)
+        if prompt_embeds_mask is None:
+            prompt_embeds_mask = torch.ones(
+                prompt_embeds.shape[:2], device=prompt_embeds.device, dtype=torch.int64
+            )
         pe = PromptEmbeds(prompt_embeds)
         pe.attention_mask = prompt_embeds_mask
         return pe
@@ -208,7 +213,7 @@ class QwenImageEditPlusModel(QwenImageModel):
             batch_size, num_channels_latents, height, width = latent_model_input.shape
             if self.vae.device != self.device_torch:
                 self.vae.to(self.device_torch)
-            
+
             control_image_res = VAE_IMAGE_SIZE
             if self.model_config.model_kwargs.get("match_target_res", False):
                 # use the current target size to set the control image res
@@ -237,7 +242,7 @@ class QwenImageEditPlusModel(QwenImageModel):
             # split the latents into batch items so we can concat the controls
             packed_latents_list = torch.chunk(latent_model_input, batch_size, dim=0)
             packed_latents_with_controls_list = []
-            
+
             batch_control_tensor_list = batch.control_tensor_list
             if batch_control_tensor_list is None and batch.control_tensor is not None:
                 batch_control_tensor_list = []
@@ -259,8 +264,8 @@ class QwenImageEditPlusModel(QwenImageModel):
                         if len(control_img.shape) == 3:
                             control_img = control_img.unsqueeze(0)
                         ratio = control_img.shape[2] / control_img.shape[3]
-                        c_width = math.sqrt(control_image_res * ratio)
-                        c_height = c_width / ratio
+                        c_height = math.sqrt(control_image_res * ratio)
+                        c_width = c_height / ratio
 
                         c_width = round(c_width / 32) * 32
                         c_height = round(c_height / 32) * 32
@@ -323,9 +328,6 @@ class QwenImageEditPlusModel(QwenImageModel):
             )
             txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist()
             enc_hs = text_embeddings.text_embeds.to(self.device_torch, self.torch_dtype)
-            prompt_embeds_mask = text_embeddings.attention_mask.to(
-                self.device_torch, dtype=torch.int64
-            )
 
         noise_pred = self.transformer(
             hidden_states=latent_model_input.to(

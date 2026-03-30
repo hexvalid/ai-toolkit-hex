@@ -32,7 +32,7 @@ def is_native_windows():
 
 if TYPE_CHECKING:
     from toolkit.stable_diffusion_model import StableDiffusion
-    
+
 
 image_extensions = ['.jpg', '.jpeg', '.png', '.webp']
 video_extensions = ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']
@@ -390,7 +390,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         self.dataset_config = dataset_config
         # update bucket divisibility
         self.dataset_config.bucket_tolerance = sd.get_bucket_divisibility()
-        self.is_video = dataset_config.num_frames > 1
+        self.is_video = dataset_config.num_frames > 1 or dataset_config.auto_frame_count
         super().__init__()
         folder_path = dataset_config.folder_path
         self.dataset_path = dataset_config.dataset_path
@@ -433,7 +433,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 self.caption_dict = json.load(f)
                 # keys are file paths
                 file_list = list(self.caption_dict.keys())
-                
+
         # remove items in the _controls_ folder
         file_list = [x for x in file_list if not os.path.basename(os.path.dirname(x)) == "_controls"]
 
@@ -467,14 +467,14 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         dataset_folder = self.dataset_path
         if not os.path.isdir(self.dataset_path):
             dataset_folder = os.path.dirname(dataset_folder)
-        
+
         dataset_size_file = os.path.join(dataset_folder, '.aitk_size.json')
         dataloader_version = "0.1.2"
         if os.path.exists(dataset_size_file):
             try:
                 with open(dataset_size_file, 'r') as f:
                     self.size_database = json.load(f)
-                
+
                 if "__version__" not in self.size_database or self.size_database["__version__"] != dataloader_version:
                     print_acc("Upgrading size database to new version")
                     # old version, delete and recreate
@@ -485,13 +485,15 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 self.size_database = {}
         else:
             self.size_database = {}
-        
+
         self.size_database["__version__"] = dataloader_version
 
         # set latent space version
         latent_space_version = "sd1"
         if self.sd is not None and self.sd.model_config.latent_space_version is not None:
             latent_space_version = self.sd.model_config.latent_space_version
+        elif self.sd is not None and self.sd.latent_space_version is not None:
+            latent_space_version = self.sd.latent_space_version
         elif self.sd.is_xl:
             latent_space_version = 'sdxl'
         elif self.sd.is_v3:
@@ -504,7 +506,14 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             latent_space_version = 'sdxl'
         else:
             latent_space_version = self.sd.model_config.arch if self.sd is not None else "sd1"
-        
+
+        temporal_compression = 8
+        if self.sd is not None:
+            if hasattr(self.sd.vae, 'config') and hasattr(self.sd.vae.config, 'scale_factor_temporal'):
+                temporal_compression = self.sd.vae.config.scale_factor_temporal
+            if hasattr(self.sd.unet, 'config') and hasattr(self.sd.unet.config, 'temporal_compression_ratio'):
+                temporal_compression = self.sd.unet.config.temporal_compression_ratio
+
         bad_count = 0
         for file in tqdm(file_list):
             try:
@@ -519,6 +528,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     text_embedding_space_version=self.sd.model_config.arch if self.sd else "sd1",
                     te_padding_side=self.sd.te_padding_side if self.sd else "right",
                     latent_space_version=latent_space_version,
+                    temporal_compression=temporal_compression,
                 )
                 self.file_list.append(file_item)
             except Exception as e:
@@ -533,7 +543,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         # save the size database
         with open(dataset_size_file, 'w') as f:
             json.dump(self.size_database, f)
-        
+
         if self.is_video:
             print_acc(f"  -  Found {len(self.file_list)} videos")
             assert len(self.file_list) > 0, f"no videos found in {self.dataset_path}"
