@@ -37,7 +37,7 @@ export const stopJob = (jobID: string) => {
 export const deleteJob = (jobID: string) => {
   return new Promise<void>((resolve, reject) => {
     apiClient
-      .get(`/api/jobs/${jobID}/delete`)
+      .delete(`/api/jobs/${jobID}/delete`)
       .then(res => res.data)
       .then(data => {
         console.log('Job deleted:', data);

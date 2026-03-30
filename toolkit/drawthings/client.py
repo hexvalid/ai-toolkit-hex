@@ -2,6 +2,7 @@ import hashlib
 import ipaddress
 import json
 import os
+import threading
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -17,6 +18,7 @@ except ImportError:  # pragma: no cover - optional at import time
 
 from toolkit.drawthings.generated.config_generated import GenerationConfigurationT, LoRAT
 from toolkit.drawthings.generated import imageService_pb2, imageService_pb2_grpc
+from .exceptions import DrawThingsCancelledError
 
 
 DRAW_THINGS_SAMPLERS = [
@@ -179,10 +181,45 @@ class DrawThingsGenerationRequest:
 
 
 class DrawThingsClient:
-    def __init__(self, config: DrawThingsConfig):
+    def __init__(self, config: DrawThingsConfig, cancel_event: Optional[threading.Event] = None):
         self.config = config
+        self._cancel_event = cancel_event
         self._catalog: Optional[dict[str, Any]] = None
         self._resolved_use_tls: Optional[bool] = None
+
+    def _raise_if_cancelled(self, operation_name: str):
+        if self._cancel_event is not None and self._cancel_event.is_set():
+            raise DrawThingsCancelledError(f"{operation_name} cancelled.")
+
+    def _start_cancel_monitor(self, rpc_call, operation_name: str):
+        if self._cancel_event is None:
+            return None, None
+
+        stop_event = threading.Event()
+
+        def watch_for_cancellation():
+            while not stop_event.wait(0.1):
+                if self._cancel_event.is_set():
+                    try:
+                        rpc_call.cancel()
+                    except Exception:
+                        pass
+                    return
+
+        thread = threading.Thread(
+            target=watch_for_cancellation,
+            name=f"drawthings-cancel-{operation_name}",
+            daemon=True,
+        )
+        thread.start()
+        return stop_event, thread
+
+    @staticmethod
+    def _stop_cancel_monitor(stop_event, thread):
+        if stop_event is None or thread is None:
+            return
+        stop_event.set()
+        thread.join(timeout=0.5)
 
     def _base_channel_options(self) -> list[tuple[str, Any]]:
         return [
@@ -268,15 +305,19 @@ class DrawThingsClient:
         return any(marker in details for marker in mismatch_markers)
 
     def _run_rpc(self, operation_name: str, callback):
+        self._raise_if_cancelled(operation_name)
         errors: list[tuple[bool, grpc.RpcError]] = []
         attempts = self._transport_attempts()
         for index, use_tls in enumerate(attempts):
+            self._raise_if_cancelled(operation_name)
             channel = self._channel(use_tls)
             try:
                 result = callback(self._stub(channel))
                 self._resolved_use_tls = use_tls
                 return result
             except grpc.RpcError as exc:
+                if self._cancel_event is not None and self._cancel_event.is_set():
+                    raise DrawThingsCancelledError(f"{operation_name} cancelled.") from exc
                 errors.append((use_tls, exc))
                 has_more_attempts = index < len(attempts) - 1
                 if has_more_attempts and self._resolved_use_tls is None and self._is_transport_mismatch_error(exc):
@@ -289,6 +330,8 @@ class DrawThingsClient:
                 channel.close()
 
         if len(errors) > 0:
+            if self._cancel_event is not None and self._cancel_event.is_set():
+                raise DrawThingsCancelledError(f"{operation_name} cancelled.")
             use_tls, exc = errors[-1]
             transport_label = "TLS" if use_tls else "plaintext"
             raise RuntimeError(
@@ -349,6 +392,7 @@ class DrawThingsClient:
         }
 
     def upload_file(self, local_path: str, remote_filename: str) -> None:
+        self._raise_if_cancelled("Draw Things upload")
         if not os.path.exists(local_path):
             raise FileNotFoundError(f"Draw Things upload source does not exist: {local_path}")
 
@@ -361,6 +405,8 @@ class DrawThingsClient:
         digest = sha256.digest()
 
         def request_iterator():
+            if self._cancel_event is not None and self._cancel_event.is_set():
+                return
             init_request = imageService_pb2.FileUploadRequest(
                 initRequest=imageService_pb2.InitUploadRequest(
                     filename=remote_filename,
@@ -373,6 +419,8 @@ class DrawThingsClient:
             offset = 0
             with open(local_path, "rb") as handle:
                 for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    if self._cancel_event is not None and self._cancel_event.is_set():
+                        return
                     payload = imageService_pb2.FileUploadRequest(
                         chunk=imageService_pb2.FileChunk(
                             filename=remote_filename,
@@ -384,20 +432,28 @@ class DrawThingsClient:
                     offset += len(chunk)
 
         def do_upload(stub):
+            self._raise_if_cancelled("Draw Things upload")
             responses = stub.UploadFile(request_iterator())
-            saw_response = False
-            for response in responses:
-                saw_response = True
-                if not response.chunkUploadSuccess:
-                    raise RuntimeError(
-                        f"Draw Things upload failed for {remote_filename}: {response.message or 'unknown error'}"
-                    )
-            if not saw_response:
-                raise RuntimeError(f"Draw Things upload returned no response for {remote_filename}.")
+            stop_event, monitor_thread = self._start_cancel_monitor(responses, "upload")
+            try:
+                saw_response = False
+                for response in responses:
+                    if self._cancel_event is not None and self._cancel_event.is_set():
+                        raise DrawThingsCancelledError("Draw Things upload cancelled.")
+                    saw_response = True
+                    if not response.chunkUploadSuccess:
+                        raise RuntimeError(
+                            f"Draw Things upload failed for {remote_filename}: {response.message or 'unknown error'}"
+                        )
+                if not saw_response:
+                    raise RuntimeError(f"Draw Things upload returned no response for {remote_filename}.")
+            finally:
+                self._stop_cancel_monitor(stop_event, monitor_thread)
 
         self._run_rpc(f"Uploading {remote_filename}", do_upload)
 
     def generate(self, request: DrawThingsGenerationRequest) -> list[Image.Image]:
+        self._raise_if_cancelled("Draw Things image generation")
         if request.sampler not in DRAW_THINGS_SAMPLERS:
             raise ValueError(f"Unsupported Draw Things sampler: {request.sampler}")
         if request.seed_mode not in DRAW_THINGS_SEED_MODES:
@@ -466,6 +522,7 @@ class DrawThingsClient:
         override = imageService_pb2.MetadataOverride(**override_kwargs)
 
         def do_generate(stub):
+            self._raise_if_cancelled("Draw Things image generation")
             generation_request = imageService_pb2.ImageGenerationRequest(
                 prompt=request.prompt,
                 negativePrompt=request.negative_prompt,
@@ -477,14 +534,20 @@ class DrawThingsClient:
             generation_request = self._with_secret(generation_request)
 
             response_stream = stub.GenerateImage(generation_request)
-            response_images: list[bytes] = []
-            for response in response_stream:
-                if len(response.generatedImages) > 0:
-                    response_images.extend(response.generatedImages)
+            stop_event, monitor_thread = self._start_cancel_monitor(response_stream, "generate")
+            try:
+                response_images: list[bytes] = []
+                for response in response_stream:
+                    if self._cancel_event is not None and self._cancel_event.is_set():
+                        raise DrawThingsCancelledError("Draw Things image generation cancelled.")
+                    if len(response.generatedImages) > 0:
+                        response_images.extend(response.generatedImages)
 
-            if len(response_images) == 0:
-                raise RuntimeError("Draw Things returned no generated images.")
+                if len(response_images) == 0:
+                    raise RuntimeError("Draw Things returned no generated images.")
 
-            return [convert_response_image(response_image) for response_image in response_images]
+                return [convert_response_image(response_image) for response_image in response_images]
+            finally:
+                self._stop_cancel_monitor(stop_event, monitor_thread)
 
         return self._run_rpc("Draw Things image generation", do_generate)

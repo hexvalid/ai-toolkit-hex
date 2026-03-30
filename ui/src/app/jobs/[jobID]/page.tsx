@@ -7,7 +7,7 @@ import { TopBar, MainContent } from '@/components/layout';
 import useJob from '@/hooks/useJob';
 import SampleImages, { SampleImagesMenu } from '@/components/SampleImages';
 import JobOverview from '@/components/JobOverview';
-import { redirect } from 'next/navigation';
+import { useRouter } from 'next/navigation';
 import JobActionBar from '@/components/JobActionBar';
 import JobConfigViewer from '@/components/JobConfigViewer';
 import JobLossGraph from '@/components/JobLossGraph';
@@ -51,11 +51,12 @@ const pages: Page[] = [
   },
 ];
 
-export default function JobPage({ params }: { params: { jobID: string } }) {
-  const usableParams = use(params as any) as { jobID: string };
+export default function JobPage({ params }: { params: Promise<{ jobID: string }> }) {
+  const usableParams = use(params);
   const jobID = usableParams.jobID;
   const { job, status, refreshJob } = useJob(jobID, 5000);
   const [pageKey, setPageKey] = useState<PageKey>('overview');
+  const router = useRouter();
 
   const page = pages.find(p => p.value === pageKey);
 
@@ -64,7 +65,7 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
       {/* Fixed top bar */}
       <TopBar>
         <div>
-          <Button className="text-gray-500 dark:text-gray-300 px-3 mt-1" onClick={() => redirect('/jobs')}>
+          <Button className="text-gray-500 dark:text-gray-300 px-3 mt-1" onClick={() => router.push('/jobs')}>
             <FaChevronLeft />
           </Button>
         </div>
@@ -78,7 +79,7 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
             onRefresh={refreshJob}
             hideView
             afterDelete={() => {
-              redirect('/jobs');
+              router.push('/jobs');
             }}
             autoStartQueue={true}
           />

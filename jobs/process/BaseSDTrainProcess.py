@@ -11,7 +11,9 @@ import os
 import re
 import threading
 import traceback
+import weakref
 from typing import Union, List, Optional
+from concurrent.futures.thread import _threads_queues, _worker
 
 import numpy as np
 import yaml
@@ -31,7 +33,7 @@ from toolkit.clip_vision_adapter import ClipVisionAdapter
 from toolkit.custom_adapter import CustomAdapter
 from toolkit.data_loader import get_dataloader_from_datasets, trigger_dataloader_setup_epoch
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
-from toolkit.drawthings import DrawThingsClient, DrawThingsConfig, DrawThingsGenerationRequest, infer_drawthings_model_version
+from toolkit.drawthings import DrawThingsCancelledError, DrawThingsClient, DrawThingsConfig, DrawThingsGenerationRequest, convert_lora_for_drawthings, infer_drawthings_model_version
 from toolkit.ema import ExponentialMovingAverage
 from toolkit.embedding import Embedding
 from toolkit.image_utils import show_tensors, show_latents, reduce_contrast
@@ -82,6 +84,29 @@ from toolkit import device_utils
 def flush():
     device_utils.empty_cache()
     gc.collect()
+
+
+class _DaemonThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):
+    # Preview workers should never keep the training process alive after stop/error.
+    def _adjust_thread_count(self):
+        if self._idle_semaphore.acquire(timeout=0):
+            return
+
+        def weakref_cb(_, q=self._work_queue):
+            q.put(None)
+
+        num_threads = len(self._threads)
+        if num_threads < self._max_workers:
+            thread_name = '%s_%d' % (self._thread_name_prefix or self, num_threads)
+            t = threading.Thread(
+                name=thread_name,
+                target=_worker,
+                args=(weakref.ref(self, weakref_cb), self._work_queue, self._initializer, self._initargs),
+            )
+            t.daemon = True
+            t.start()
+            self._threads.add(t)
+            _threads_queues[t] = self._work_queue
 
 
 class BaseSDTrainProcess(BaseTrainProcess):
@@ -278,17 +303,140 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self._last_periodic_drawthings_sample_step: Optional[int] = None
         self._startup_first_sample_queued = False
         self._startup_baseline_sample_queued = False
+        self._drawthings_sample_cancel_event = threading.Event()
 
     def post_process_generate_image_config_list(self, generate_image_config_list: List[GenerateImageConfig]):
         # override in subclass
         return generate_image_config_list
 
-    def _get_drawthings_remote_lora_filename(self) -> str:
+    def _get_sample_batch_label(self, step: Optional[int], is_first: bool) -> str:
+        if is_first:
+            return "first"
+        if step is None:
+            return "final"
+        return f"step_{str(step).zfill(9)}"
+
+    def _get_sample_count_token(self, sample_index: int, total_sample_count: int) -> str:
+        max_count = max(total_sample_count - 1, 0)
+        return str(sample_index).zfill(len(str(max_count)))
+
+    def _get_sample_state_dir(self, sample_folder: str) -> str:
+        return os.path.join(sample_folder, ".aitk_state")
+
+    def _get_sample_completion_marker_path(
+        self,
+        sample_folder: str,
+        step: Optional[int],
+        is_first: bool,
+        sample_index: int,
+        total_sample_count: int,
+    ) -> str:
+        count_token = self._get_sample_count_token(sample_index, total_sample_count)
+        batch_label = self._get_sample_batch_label(step, is_first)
+        return os.path.join(self._get_sample_state_dir(sample_folder), f"{batch_label}_{count_token}.json")
+
+    def _get_sample_signature(self, gen_img_config: GenerateImageConfig) -> str:
+        signature_payload = {
+            "prompt": gen_img_config.prompt,
+            "negative_prompt": gen_img_config.negative_prompt,
+            "width": gen_img_config.width,
+            "height": gen_img_config.height,
+            "seed": gen_img_config.seed,
+            "num_inference_steps": gen_img_config.num_inference_steps,
+            "guidance_scale": gen_img_config.guidance_scale,
+            "network_multiplier": gen_img_config.network_multiplier,
+            "output_ext": gen_img_config.output_ext,
+            "num_frames": gen_img_config.num_frames,
+            "fps": gen_img_config.fps,
+        }
+        return hashlib.sha1(json.dumps(signature_payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+    def _record_sample_completion(
+        self,
+        sample_folder: str,
+        step: Optional[int],
+        is_first: bool,
+        sample_index: int,
+        total_sample_count: int,
+        output_path: str,
+        signature: str,
+    ):
+        state_dir = self._get_sample_state_dir(sample_folder)
+        os.makedirs(state_dir, exist_ok=True)
+        marker_path = self._get_sample_completion_marker_path(
+            sample_folder,
+            step,
+            is_first,
+            sample_index,
+            total_sample_count,
+        )
+        marker_payload = {
+            "output_path": output_path,
+            "signature": signature,
+        }
+        with open(marker_path, "w", encoding="utf-8") as marker_file:
+            json.dump(marker_payload, marker_file)
+
+    def _find_existing_sample_output(
+        self,
+        sample_folder: str,
+        step: Optional[int],
+        is_first: bool,
+        sample_index: int,
+        total_sample_count: int,
+        sample_ext: str,
+        signature: str,
+    ) -> Optional[str]:
+        marker_path = self._get_sample_completion_marker_path(
+            sample_folder,
+            step,
+            is_first,
+            sample_index,
+            total_sample_count,
+        )
+        if os.path.exists(marker_path):
+            try:
+                with open(marker_path, "r", encoding="utf-8") as marker_file:
+                    marker_payload = json.load(marker_file)
+                output_path = marker_payload.get("output_path")
+                marker_signature = marker_payload.get("signature")
+                if (
+                    isinstance(output_path, str)
+                    and os.path.exists(output_path)
+                    and isinstance(marker_signature, str)
+                    and marker_signature == signature
+                ):
+                    return output_path
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                pass
+
+        legacy_step = step
+        if legacy_step is None and is_first:
+            legacy_step = 0
+        if legacy_step is None:
+            return None
+
+        count_token = self._get_sample_count_token(sample_index, total_sample_count)
+        ext = sample_ext[1:] if sample_ext.startswith(".") else sample_ext
+        legacy_pattern = os.path.join(
+            sample_folder,
+            f"*_{str(legacy_step).zfill(9)}_{count_token}.{ext}",
+        )
+        legacy_matches = glob.glob(legacy_pattern)
+        if len(legacy_matches) == 0:
+            return None
+        legacy_matches.sort(key=os.path.getmtime, reverse=True)
+        return legacy_matches[0]
+
+    def _get_drawthings_remote_lora_name(self) -> str:
         safe_job_name = re.sub(r'[^A-Za-z0-9._-]+', '_', self.job.name).strip('._')
         if safe_job_name == '':
             safe_job_name = 'aitk_job'
         job_hash = hashlib.md5(self.save_root.encode('utf-8')).hexdigest()[:8]
-        return f"aitk_{safe_job_name}_{job_hash}_preview.safetensors"
+        return f"aitk_{safe_job_name}_{job_hash}_preview"
+
+    def _get_drawthings_remote_lora_filename(self) -> str:
+        return f"{self._get_drawthings_remote_lora_name()}_lora_f16.ckpt"
 
     def _get_drawthings_local_lora_path(self, step: Optional[int], is_first: bool, sample_time: int) -> str:
         local_drawthings_dir = os.path.join(self.save_root, '.drawthings')
@@ -332,11 +480,76 @@ class BaseSDTrainProcess(BaseTrainProcess):
     def _ensure_drawthings_sample_executor(self) -> concurrent.futures.ThreadPoolExecutor:
         if self._drawthings_sample_executor is None:
             safe_job_name = re.sub(r'[^A-Za-z0-9._-]+', '_', self.job.name).strip('._') or 'aitk_job'
-            self._drawthings_sample_executor = concurrent.futures.ThreadPoolExecutor(
+            self._drawthings_sample_executor = _DaemonThreadPoolExecutor(
                 max_workers=1,
                 thread_name_prefix=f"drawthings-{safe_job_name}",
             )
         return self._drawthings_sample_executor
+
+    def _request_drawthings_sample_stop(self):
+        self._drawthings_sample_cancel_event.set()
+
+    def _wait_for_drawthings_sample_stop(self, timeout_seconds: float = 5.0):
+        deadline = time.time() + max(timeout_seconds, 0.0)
+        while time.time() < deadline:
+            self._prune_completed_drawthings_sample_futures()
+            with self._drawthings_sample_lock:
+                if len(self._drawthings_sample_futures) == 0:
+                    return
+            time.sleep(0.1)
+
+    def _clear_drawthings_sample_state(self):
+        with self._drawthings_sample_lock:
+            self._drawthings_sample_futures.clear()
+            self._last_periodic_drawthings_sample_future = None
+            self._last_periodic_drawthings_sample_step = None
+
+    def _release_training_resources(self):
+        progress_bar = getattr(self, 'progress_bar', None)
+        if progress_bar is not None:
+            try:
+                progress_bar.close()
+            except Exception:
+                pass
+            self.progress_bar = None
+
+        modules_being_trained = getattr(self, 'modules_being_trained', None)
+        if isinstance(modules_being_trained, list):
+            modules_being_trained.clear()
+
+        heavy_attrs = [
+            'sd',
+            'network',
+            'embedding',
+            'adapter',
+            'decorator',
+            'optimizer',
+            'lr_scheduler',
+            'ema',
+            'snr_gos',
+            'data_loader',
+            'data_loader_reg',
+            'datasets',
+            'datasets_reg',
+            'assistant_adapter',
+            'taesd',
+            'dfe',
+            'cached_blank_embeds',
+            'cached_trigger_embeds',
+            'diff_output_preservation_embeds',
+            'unconditional_embeds',
+            'batch_negative_prompt',
+            '_clip_image_embeds_unconditional',
+            'logger',
+        ]
+        for attr_name in heavy_attrs:
+            if hasattr(self, attr_name):
+                try:
+                    setattr(self, attr_name, None)
+                except Exception:
+                    pass
+
+        flush()
 
     def _record_drawthings_sample_error(self, exc: Exception):
         with self._drawthings_sample_lock:
@@ -432,21 +645,57 @@ class BaseSDTrainProcess(BaseTrainProcess):
         is_first: bool,
         drawthings_config: DrawThingsConfig,
         drawthings_sampler: str,
-        gen_img_config_list: List[GenerateImageConfig],
+        sample_tasks: List[tuple[int, GenerateImageConfig, str]],
+        total_sample_count: int,
         local_lora_path: Optional[str],
         remote_lora_filename: Optional[str],
         inferred_model_version: Optional[str],
     ):
         step_label = "first" if is_first else ("final" if step is None else str(step))
-        total_imgs = len(gen_img_config_list)
+        total_imgs = len(sample_tasks)
         print_acc(f"Starting background Draw Things sample batch for {step_label} with {total_imgs} prompt(s)")
 
-        client = DrawThingsClient(drawthings_config)
+        if self._drawthings_sample_cancel_event.is_set():
+            print_acc(f"Skipping background Draw Things sample batch for {step_label}; shutdown requested")
+            return
+
+        client = DrawThingsClient(drawthings_config, cancel_event=self._drawthings_sample_cancel_event)
+        converted_lora_path = None
+        uploaded_remote_lora_filename = remote_lora_filename
         try:
             if local_lora_path is not None and remote_lora_filename is not None:
-                client.upload_file(local_lora_path, remote_lora_filename)
+                print_acc(f"Converting LoRA export for Draw Things preview batch {step_label}")
+                converted_lora_path = convert_lora_for_drawthings(
+                    input_path=local_lora_path,
+                    output_dir=os.path.dirname(local_lora_path),
+                    name=self._get_drawthings_remote_lora_name(),
+                    version=inferred_model_version,
+                    cancel_event=self._drawthings_sample_cancel_event,
+                )
+                uploaded_remote_lora_filename = os.path.basename(converted_lora_path)
+                converted_lora_size_mb = os.path.getsize(converted_lora_path) / (1024 * 1024)
+                print_acc(
+                    f"Converted Draw Things preview LoRA for batch {step_label}: "
+                    f"{uploaded_remote_lora_filename} ({converted_lora_size_mb:.1f} MiB)"
+                )
+                if self._drawthings_sample_cancel_event.is_set():
+                    print_acc(f"Skipping Draw Things LoRA upload for {step_label}; shutdown requested")
+                    return
+                print_acc(
+                    f"Uploading Draw Things preview LoRA for batch {step_label}: "
+                    f"{uploaded_remote_lora_filename}"
+                )
+                client.upload_file(converted_lora_path, uploaded_remote_lora_filename)
+                print_acc(f"Uploaded Draw Things preview LoRA for batch {step_label}")
 
-            for i, gen_img_config in enumerate(gen_img_config_list):
+            for sample_index, gen_img_config, signature in sample_tasks:
+                if self._drawthings_sample_cancel_event.is_set():
+                    print_acc(f"Stopping background Draw Things sample batch for {step_label}; shutdown requested")
+                    return
+                print_acc(
+                    f"Requesting Draw Things preview image {sample_index + 1}/{total_imgs} "
+                    f"for batch {step_label}"
+                )
                 generated_images = client.generate(
                     DrawThingsGenerationRequest(
                         prompt=gen_img_config.prompt,
@@ -458,7 +707,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         seed=gen_img_config.seed,
                         sampler=drawthings_sampler,
                         model_file=drawthings_config.model,
-                        lora_file=remote_lora_filename,
+                        lora_file=uploaded_remote_lora_filename,
                         lora_weight=gen_img_config.network_multiplier,
                         seed_mode=drawthings_config.seed_mode,
                         clip_skip=drawthings_config.clip_skip,
@@ -472,14 +721,39 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 if len(generated_images) == 0:
                     raise RuntimeError("Draw Things returned no images for a sample prompt.")
 
-                output_path = gen_img_config.get_image_path(i, total_imgs - 1)
+                if self._drawthings_sample_cancel_event.is_set():
+                    print_acc(f"Dropping Draw Things sample outputs for {step_label}; shutdown requested")
+                    return
+
+                output_path = gen_img_config.get_image_path(sample_index, total_sample_count - 1)
                 self._save_drawthings_image(generated_images[0], output_path)
+                print_acc(
+                    f"Saved Draw Things preview image {sample_index + 1}/{total_imgs} "
+                    f"for batch {step_label} to {output_path}"
+                )
+                self._record_sample_completion(
+                    sample_folder=os.path.dirname(output_path),
+                    step=step,
+                    is_first=is_first,
+                    sample_index=sample_index,
+                    total_sample_count=total_sample_count,
+                    output_path=output_path,
+                    signature=signature,
+                )
 
             print_acc(f"Completed background Draw Things sample batch for {step_label}")
+        except DrawThingsCancelledError:
+            print_acc(f"Cancelled background Draw Things sample batch for {step_label}; shutdown requested")
+            return
         finally:
             if local_lora_path is not None and os.path.exists(local_lora_path):
                 try:
                     os.remove(local_lora_path)
+                except OSError:
+                    pass
+            if converted_lora_path is not None and os.path.exists(converted_lora_path):
+                try:
+                    os.remove(converted_lora_path)
                 except OSError:
                     pass
 
@@ -547,7 +821,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # zero-pad 9 digits
                 step_num = f"_{str(step).zfill(9)}"
 
-            filename = f"[time]_{step_num}_[count].{self.sample_config.ext}"
+            filename = f"[time]_{step_num}_[count].{sample_config.ext}"
 
             output_path = os.path.join(sample_folder, filename)
 
@@ -611,11 +885,51 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         # post process
         gen_img_config_list = self.post_process_generate_image_config_list(gen_img_config_list)
+
+        total_sample_count = len(gen_img_config_list)
+        sample_tasks: List[tuple[int, GenerateImageConfig, str]] = []
+        skipped_existing_samples = 0
+        for sample_index, gen_img_config in enumerate(gen_img_config_list):
+            signature = self._get_sample_signature(gen_img_config)
+            existing_output = self._find_existing_sample_output(
+                sample_folder=sample_folder,
+                step=step,
+                is_first=is_first,
+                sample_index=sample_index,
+                total_sample_count=total_sample_count,
+                sample_ext=gen_img_config.output_ext,
+                signature=signature,
+            )
+            if existing_output is not None:
+                self._record_sample_completion(
+                    sample_folder=sample_folder,
+                    step=step,
+                    is_first=is_first,
+                    sample_index=sample_index,
+                    total_sample_count=total_sample_count,
+                    output_path=existing_output,
+                    signature=signature,
+                )
+                skipped_existing_samples += 1
+                continue
+            sample_tasks.append((sample_index, gen_img_config, signature))
+
+        step_label = "first sample" if is_first else ("final sample" if step is None else f"step {step}")
+        if len(sample_tasks) == 0:
+            print_acc(f"Skipping {step_label}; all {total_sample_count} sample output(s) already exist")
+            return
+        if skipped_existing_samples > 0:
+            print_acc(
+                f"Skipping {skipped_existing_samples} existing sample output(s) for {step_label}; "
+                f"queueing {len(sample_tasks)} missing sample(s)"
+            )
+
         legacy_sampler_map = {
             'flowmatch': 'DPM++ 2M Karras',
             'ddpm': 'DPM++ 2M Karras',
         }
         drawthings_sampler = legacy_sampler_map.get(sample_config.sampler, sample_config.sampler)
+        inferred_model_version = infer_drawthings_model_version(self.model_config.arch)
 
         drawthings_config = DrawThingsConfig(
             server=sample_config.drawthings.server,
@@ -632,7 +946,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             raise ValueError("Draw Things sampling requires `sample.drawthings.model` to be configured.")
 
         shared_gen_time = int(time.time() * 1000)
-        for gen_img_config in gen_img_config_list:
+        for _, gen_img_config, _ in sample_tasks:
             gen_img_config.set_gen_time(shared_gen_time)
             has_control_images = any([
                 gen_img_config.ctrl_img,
@@ -671,10 +985,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
             is_first=is_first,
             drawthings_config=drawthings_config,
             drawthings_sampler=drawthings_sampler,
-            gen_img_config_list=gen_img_config_list,
+            sample_tasks=sample_tasks,
+            total_sample_count=total_sample_count,
             local_lora_path=local_lora_path,
             remote_lora_filename=remote_lora_filename,
-            inferred_model_version=infer_drawthings_model_version(self.model_config.arch),
+            inferred_model_version=inferred_model_version,
         )
         with self._drawthings_sample_lock:
             self._drawthings_sample_futures.append(future)
@@ -683,11 +998,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self._last_periodic_drawthings_sample_step = step
             pending_batches = len(self._drawthings_sample_futures)
 
-        step_label = "first sample" if is_first else ("final sample" if step is None else f"step {step}")
         sample_mode_label = "base model" if remote_base_only else "LoRA"
         print_acc(
             f"Queued background Draw Things {sample_mode_label} sample batch for {step_label} "
-            f"with {len(gen_img_config_list)} prompt(s). Pending batches: {pending_batches}"
+            f"with {len(sample_tasks)} prompt(s). Pending batches: {pending_batches}"
         )
 
     def update_training_metadata(self):
@@ -807,7 +1121,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self._shutdown_drawthings_sample_executor(wait=True)
 
     def on_error(self, e: Exception):
+        self._request_drawthings_sample_stop()
+        self._wait_for_drawthings_sample_stop(timeout_seconds=5.0)
         self._shutdown_drawthings_sample_executor(wait=False, cancel_futures=True)
+        self._clear_drawthings_sample_state()
+        self._release_training_resources()
     
     def end_step_hook(self):
         pass

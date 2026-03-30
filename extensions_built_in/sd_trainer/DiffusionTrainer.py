@@ -60,6 +60,7 @@ class DiffusionTrainer(SDTrainer):
                 if self.should_stop():
                     # Mark and update status (non-blocking; uses existing infra)
                     self.is_stopping = True
+                    self._request_drawthings_sample_stop()
                     self._run_async_operation(
                         self._update_status("stopped", "Job stopped (remote)")
                     )
@@ -144,11 +145,13 @@ class DiffusionTrainer(SDTrainer):
             self._run_async_operation(
                 self._update_status("stopped", "Job stopped"))
             self.is_stopping = True
+            self._request_drawthings_sample_stop()
             raise Exception("Job stopped")
         if self.should_return_to_queue():
             self._run_async_operation(
                 self._update_status("queued", "Job queued"))
             self.is_stopping = True
+            self._request_drawthings_sample_stop()
             raise Exception("Job returning to queue")
 
     async def _update_key(self, key, value):

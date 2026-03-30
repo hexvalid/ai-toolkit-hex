@@ -41,8 +41,13 @@ export default function Datasets() {
       className: 'w-20 text-right',
       render: row => (
         <button
+          type="button"
           className="text-gray-200 hover:bg-red-600 p-2 rounded-full transition-colors"
-          onClick={() => handleDeleteDataset(row.name)}
+          onClick={event => {
+            event.preventDefault();
+            event.stopPropagation();
+            handleDeleteDataset(row.name);
+          }}
         >
           <FaRegTrashAlt />
         </button>
@@ -56,16 +61,14 @@ export default function Datasets() {
       message: `Are you sure you want to delete the dataset "${datasetName}"? This action cannot be undone.`,
       type: 'warning',
       confirmText: 'Delete',
-      onConfirm: () => {
-        apiClient
-          .post('/api/datasets/delete', { name: datasetName })
-          .then(() => {
-            console.log('Dataset deleted:', datasetName);
-            refreshDatasets();
-          })
-          .catch(error => {
-            console.error('Error deleting dataset:', error);
-          });
+      onConfirm: async () => {
+        try {
+          await apiClient.delete('/api/datasets/delete', { data: { name: datasetName } });
+          console.log('Dataset deleted:', datasetName);
+          refreshDatasets();
+        } catch (error) {
+          console.error('Error deleting dataset:', error);
+        }
       },
     });
   };
