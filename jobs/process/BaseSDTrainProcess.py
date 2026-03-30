@@ -1323,13 +1323,27 @@ class BaseSDTrainProcess(BaseTrainProcess):
             try:
                 filename = f'optimizer.pt'
                 file_path = os.path.join(self.save_root, filename)
+                previous_file_path = os.path.join(self.save_root, 'optimizer_prev.pt')
+                temp_file_path = f'{file_path}.tmp'
                 try:
                     state_dict = unwrap_model(self.optimizer).state_dict()
                 except Exception as e:
                     state_dict = self.optimizer.state_dict()
-                torch.save(state_dict, file_path)
+
+                if os.path.exists(temp_file_path):
+                    os.remove(temp_file_path)
+
+                torch.save(state_dict, temp_file_path)
+                if os.path.exists(file_path):
+                    try:
+                        os.replace(file_path, previous_file_path)
+                    except Exception as backup_error:
+                        print_acc(f"Could not rotate optimizer backup: {backup_error}")
+                os.replace(temp_file_path, file_path)
                 print_acc(f"Saved optimizer to {file_path}")
             except Exception as e:
+                if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
+                    os.remove(temp_file_path)
                 print_acc(e)
                 print_acc("Could not save optimizer")
 
@@ -1457,6 +1471,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
             # Filter out non-existent paths and sort by creation time
             if paths:
                 paths = [p for p in paths if os.path.exists(p)]
+                paths = [
+                    p for p in paths
+                    if os.path.isdir(p) or p.endswith('.safetensors') or p.endswith('.pt')
+                ]
                 # remove false positives
                 if '_LoRA' not in name:
                     paths = [p for p in paths if '_LoRA' not in p]
@@ -1468,7 +1486,16 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     paths = [p for p in paths if '_cn' not in p]
 
                 if len(paths) > 0:
-                    latest_path = max(paths, key=os.path.getctime)
+                    def get_sort_key(path_to_sort):
+                        basename = os.path.basename(path_to_sort.rstrip(os.sep))
+                        step_match = re.search(r'_(\d+)(?:\.(?:safetensors|pt))?$', basename)
+                        modified_time = os.path.getmtime(path_to_sort)
+                        if step_match:
+                            return (1, int(step_match.group(1)), modified_time)
+                        # Final files/directories without step numbers should win over numbered checkpoints.
+                        return (2, 0, modified_time)
+
+                    latest_path = max(paths, key=get_sort_key)
 
         if latest_path is None and self.network_config is not None and self.network_config.pretrained_lora_path is not None:
             # set pretrained lora path as load path if we do not have a checkpoint to resume from
@@ -2632,9 +2659,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.optimizer.enable_paramiter_swapping(self.train_config.paramiter_swapping_factor)
 
         # check if it exists
-        optimizer_state_filename = f'optimizer.pt'
-        optimizer_state_file_path = os.path.join(self.save_root, optimizer_state_filename)
-        if os.path.exists(optimizer_state_file_path):
+        optimizer_state_paths = [
+            os.path.join(self.save_root, 'optimizer.pt'),
+            os.path.join(self.save_root, 'optimizer_prev.pt'),
+        ]
+        existing_optimizer_state_paths = [
+            path for path in optimizer_state_paths if os.path.exists(path)
+        ]
+        if existing_optimizer_state_paths:
             # try to load
             # previous param groups
             # previous_params = copy.deepcopy(optimizer.param_groups)
@@ -2650,15 +2682,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     load_optimizer = False
 
             if load_optimizer:
-                try:
-                    print_acc(f"Loading optimizer state from {optimizer_state_file_path}")
-                    optimizer_state_dict = torch.load(optimizer_state_file_path, weights_only=True)
-                    optimizer.load_state_dict(optimizer_state_dict)
-                    del optimizer_state_dict
-                    flush()
-                except Exception as e:
-                    print_acc(f"Failed to load optimizer state from {optimizer_state_file_path}")
-                    print_acc(e)
+                for optimizer_state_file_path in existing_optimizer_state_paths:
+                    try:
+                        print_acc(f"Loading optimizer state from {optimizer_state_file_path}")
+                        optimizer_state_dict = torch.load(optimizer_state_file_path, weights_only=True)
+                        optimizer.load_state_dict(optimizer_state_dict)
+                        del optimizer_state_dict
+                        flush()
+                        break
+                    except Exception as e:
+                        print_acc(f"Failed to load optimizer state from {optimizer_state_file_path}")
+                        print_acc(e)
 
             # update the optimizer LR from the params
             print_acc(f"Updating optimizer LR from params")

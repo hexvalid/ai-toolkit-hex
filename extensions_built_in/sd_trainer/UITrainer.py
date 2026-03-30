@@ -26,6 +26,7 @@ class UITrainer(SDTrainer):
         if self.job_id is None:
             raise Exception("AITK_JOB_ID not set")
         self.is_stopping = False
+        self._is_saving = False
         # Create a thread pool for database operations
         self.thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Track all async tasks
@@ -129,18 +130,46 @@ class UITrainer(SDTrainer):
         return _check_return_to_queue()
 
     def maybe_stop(self):
+        if self._is_saving:
+            return
         if self.should_stop():
+            self.is_stopping = True
+            self._request_drawthings_sample_stop()
+            self._save_emergency_checkpoint("stop")
             self._run_async_operation(
                 self._update_status("stopped", "Job stopped"))
-            self.is_stopping = True
-            self._request_drawthings_sample_stop()
             raise Exception("Job stopped")
         if self.should_return_to_queue():
-            self._run_async_operation(
-                self._update_status("queued", "Job queued"))
             self.is_stopping = True
             self._request_drawthings_sample_stop()
+            self._save_emergency_checkpoint("queue")
+            self._run_async_operation(
+                self._update_status("queued", "Job queued"))
             raise Exception("Job returning to queue")
+
+    def _save_emergency_checkpoint(self, reason: str):
+        if self._is_saving:
+            return
+
+        accelerator = getattr(self, "accelerator", None)
+        if accelerator is None or not accelerator.is_main_process:
+            return
+
+        current_step = getattr(self, "step_num", None)
+        if current_step is None:
+            return
+
+        if current_step <= getattr(self, "last_save_step", -1):
+            return
+
+        self._is_saving = True
+        try:
+            self.update_status("running", f"Saving model before {reason}")
+            super(UITrainer, self).save(current_step)
+        except Exception as save_error:
+            print(f"Failed to save checkpoint before {reason}: {save_error}")
+        finally:
+            self._is_saving = False
 
     async def _update_key(self, key, value):
         if not self.accelerator.is_main_process:
@@ -219,6 +248,10 @@ class UITrainer(SDTrainer):
             self._async_tasks.clear()
 
     def on_error(self, e: Exception):
+        if self.should_stop() or self.should_return_to_queue():
+            self.is_stopping = True
+            self._request_drawthings_sample_stop()
+            self._save_emergency_checkpoint("stop")
         super(UITrainer, self).on_error(e)
         if self.accelerator.is_main_process and not self.is_stopping:
             self.update_status("error", str(e))
@@ -292,8 +325,10 @@ class UITrainer(SDTrainer):
         self.update_status("running", f"Waiting for {pending_batches} background sample batch(es)")
 
     def save(self, step=None):
-        self.maybe_stop()
-        self.update_status("running", "Saving model")
+        if not self._is_saving:
+            self.maybe_stop()
+            self.update_status("running", "Saving model")
         super().save(step)
-        self.maybe_stop()
-        self.update_status("running", "Training")
+        if not self._is_saving:
+            self.maybe_stop()
+            self.update_status("running", "Training")
