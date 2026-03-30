@@ -1,6 +1,5 @@
 'use client';
 
-import GpuMonitor from '@/components/GPUMonitor';
 import JobsTable from '@/components/JobsTable';
 import { TopBar, MainContent } from '@/components/layout';
 import Link from 'next/link';
@@ -15,8 +14,7 @@ export default function Dashboard() {
         <div className="flex-1"></div>
       </TopBar>
       <MainContent>
-        <GpuMonitor />
-        <div className="w-full mt-4">
+        <div className="w-full">
           <div className="flex justify-between items-center mb-2">
             <h1 className="text-md">Queues</h1>
             <div className="text-xs text-gray-500">

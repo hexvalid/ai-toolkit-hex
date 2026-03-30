@@ -9,7 +9,6 @@ import { objectCopy } from '@/utils/basic';
 import { useNestedState, setNestedValue } from '@/utils/hooks';
 import { SelectInput } from '@/components/formInputs';
 import useSettings from '@/hooks/useSettings';
-import useGPUInfo from '@/hooks/useGPUInfo';
 import useDatasetList from '@/hooks/useDatasetList';
 import YAML from 'yaml';
 import path from 'path';
@@ -22,15 +21,15 @@ import ErrorBoundary from '@/components/ErrorBoundary';
 import { apiClient } from '@/utils/api';
 
 const isDev = process.env.NODE_ENV === 'development';
+const DEFAULT_QUEUE_TARGET = 'mps';
 
 export default function TrainingForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const runId = searchParams.get('id');
   const cloneId = searchParams.get('cloneId');
-  const [gpuIDs, setGpuIDs] = useState<string | null>(null);
+  const [gpuIDs, setGpuIDs] = useState<string | null>(DEFAULT_QUEUE_TARGET);
   const { settings, isSettingsLoaded } = useSettings();
-  const { gpuList, isGPUInfoLoaded } = useGPUInfo();
   const { datasets, status: datasetFetchStatus } = useDatasetList();
   const [datasetOptions, setDatasetOptions] = useState<{ value: string; label: string }[]>([]);
   const [showAdvancedView, setShowAdvancedView] = useState(false);
@@ -62,7 +61,7 @@ export default function TrainingForm() {
         try {
           parsed.config.process[0].sqlite_db_path = './aitk_db.db';
           parsed.config.process[0].training_folder = settings.TRAINING_FOLDER;
-          parsed.config.process[0].device = 'cuda';
+          parsed.config.process[0].device = 'mps';
           parsed.config.process[0].performance_log_every = 10;
         } catch (err) {
           console.warn('Could not set required fields on imported config:', err);
@@ -135,12 +134,10 @@ export default function TrainingForm() {
   }, [runId]);
 
   useEffect(() => {
-    if (isGPUInfoLoaded) {
-      if (gpuIDs === null && gpuList.length > 0) {
-        setGpuIDs(`${gpuList[0].index}`);
-      }
+    if (gpuIDs === null) {
+      setGpuIDs(DEFAULT_QUEUE_TARGET);
     }
-  }, [gpuList, isGPUInfoLoaded]);
+  }, [gpuIDs]);
 
   useEffect(() => {
     if (isSettingsLoaded) {
@@ -201,13 +198,7 @@ export default function TrainingForm() {
         <div className="flex-1"></div>
         {showAdvancedView && (
           <>
-            <div>
-              <SelectInput
-                value={`${gpuIDs}`}
-                onChange={value => setGpuIDs(value)}
-                options={gpuList.map((gpu: any) => ({ value: `${gpu.index}`, label: `GPU #${gpu.index}` }))}
-              />
-            </div>
+            <div className="text-sm text-gray-400 px-2">Target: {gpuIDs || DEFAULT_QUEUE_TARGET}</div>
             <div className="mx-4 bg-gray-200 dark:bg-gray-800 w-1 h-6"></div>
             <div>
               <Button
@@ -288,9 +279,6 @@ export default function TrainingForm() {
             status={status}
             handleSubmit={handleSubmit}
             runId={runId}
-            gpuIDs={gpuIDs}
-            setGpuIDs={setGpuIDs}
-            gpuList={gpuList}
             datasetOptions={datasetOptions}
             settings={settings}
           />
@@ -310,11 +298,8 @@ export default function TrainingForm() {
               status={status}
               handleSubmit={handleSubmit}
               runId={runId}
-              gpuIDs={gpuIDs}
-              setGpuIDs={setGpuIDs}
-              gpuList={gpuList}
               datasetOptions={datasetOptions}
-              isLoading={!isSettingsLoaded || !isGPUInfoLoaded || datasetFetchStatus !== 'success'}
+              isLoading={!isSettingsLoaded || datasetFetchStatus !== 'success'}
             />
           </ErrorBoundary>
 

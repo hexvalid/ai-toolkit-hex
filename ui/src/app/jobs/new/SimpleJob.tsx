@@ -27,9 +27,6 @@ type Props = {
   status: 'idle' | 'saving' | 'success' | 'error';
   handleSubmit: (event: React.FormEvent<HTMLFormElement>) => void;
   runId: string | null;
-  gpuIDs: string | null;
-  setGpuIDs: (value: string | null) => void;
-  gpuList: any;
   datasetOptions: any;
   isLoading?: boolean;
 };
@@ -42,9 +39,6 @@ export default function SimpleJob({
   handleSubmit,
   status,
   runId,
-  gpuIDs,
-  setGpuIDs,
-  gpuList,
   datasetOptions,
   isLoading,
 }: Props) {
@@ -259,13 +253,6 @@ export default function SimpleJob({
               placeholder="Enter training name"
               disabled={runId !== null}
               required
-            />
-            <SelectInput
-              label="GPU ID"
-              value={`${gpuIDs}`}
-              docKey="gpuids"
-              onChange={value => setGpuIDs(value)}
-              options={gpuList.map((gpu: any) => ({ value: `${gpu.index}`, label: `GPU #${gpu.index}` }))}
             />
             {disableSections.includes('trigger_word') ? null : (
               <TextInput

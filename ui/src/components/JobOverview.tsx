@@ -1,11 +1,7 @@
 import { Job } from '@prisma/client';
-import useGPUInfo from '@/hooks/useGPUInfo';
-import useCPUInfo from '@/hooks/useCPUInfo';
-import GPUWidget from '@/components/GPUWidget';
-import CPUWidget from '@/components/CPUWidget';
 import FilesWidget from '@/components/FilesWidget';
 import { getTotalSteps } from '@/utils/jobs';
-import { Cpu, HardDrive, Info, Gauge } from 'lucide-react';
+import { HardDrive, Info, Gauge } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import useJobLog from '@/hooks/useJobLog';
 
@@ -14,14 +10,11 @@ interface JobOverviewProps {
 }
 
 export default function JobOverview({ job }: JobOverviewProps) {
-  const gpuIds = useMemo(() => job.gpu_ids.split(',').map(id => parseInt(id)), [job.gpu_ids]);
-  const { log, setLog, status: statusLog, refresh: refreshLog } = useJobLog(job.id, 2000);
+  const { log, status: statusLog } = useJobLog(job.id, 2000);
   const logRef = useRef<HTMLDivElement>(null);
   // Track whether we should auto-scroll to bottom
   const [isScrolledToBottom, setIsScrolledToBottom] = useState(true);
 
-  const { gpuList, isGPUInfoLoaded } = useGPUInfo(gpuIds, 5000);
-  const { cpuInfo, isCPUInfoLoaded } = useCPUInfo(5000);
   const totalSteps = getTotalSteps(job);
   const progress = (job.step / totalSteps) * 100;
   const isStopping = job.stop && job.status === 'running';
@@ -118,10 +111,10 @@ export default function JobOverview({ job }: JobOverviewProps) {
             </div>
 
             <div className="flex items-center space-x-4">
-              <Cpu className="w-5 h-5 text-purple-400" />
+              <HardDrive className="w-5 h-5 text-purple-400" />
               <div>
-                <p className="text-xs text-gray-400">Assigned GPUs</p>
-                <p className="text-sm font-medium text-gray-200">GPUs: {job.gpu_ids}</p>
+                <p className="text-xs text-gray-400">Target Queue</p>
+                <p className="text-sm font-medium text-gray-200">{job.gpu_ids}</p>
               </div>
             </div>
 
@@ -157,9 +150,7 @@ export default function JobOverview({ job }: JobOverviewProps) {
 
       {/* GPU Widget Panel */}
       <div className="col-span-1">
-        <div>{isCPUInfoLoaded && cpuInfo && <CPUWidget cpu={cpuInfo} />}</div>
-        <div className="mt-4">{isGPUInfoLoaded && gpuList.length > 0 && <GPUWidget gpu={gpuList[0]} />}</div>
-        <div className="mt-4">
+        <div>
           <FilesWidget jobID={job.id} />
         </div>
       </div>

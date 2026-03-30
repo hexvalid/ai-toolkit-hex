@@ -2,24 +2,31 @@ import { useMemo } from 'react';
 import useJobsList from '@/hooks/useJobsList';
 import Link from 'next/link';
 import UniversalTable, { TableColumn } from '@/components/UniversalTable';
-import { GpuInfo, JobConfig } from '@/types';
+import { JobConfig } from '@/types';
 import JobActionBar from './JobActionBar';
 import { Job, Queue } from '@prisma/client';
 import useQueueList from '@/hooks/useQueueList';
 import classNames from 'classnames';
 import { startQueue, stopQueue } from '@/utils/queue';
 import { CgSpinner } from 'react-icons/cg';
-import useGPUInfo from '@/hooks/useGPUInfo';
 
 interface JobsTableProps {
   autoStartQueue?: boolean;
   onlyActive?: boolean;
 }
 
+const LOCAL_QUEUE_KEYS = new Set(['0', 'mps']);
+
+function getQueueLabel(queueKey: string): string {
+  if (LOCAL_QUEUE_KEYS.has(queueKey)) {
+    return 'This Machine';
+  }
+  return queueKey;
+}
+
 export default function JobsTable({ onlyActive = false }: JobsTableProps) {
   const { jobs, status, refreshJobs } = useJobsList(onlyActive, 5000);
   const { queues, status: queueStatus, refreshQueues } = useQueueList();
-  const { gpuList, isGPUInfoLoaded } = useGPUInfo();
 
   const refresh = () => {
     refreshJobs();
@@ -93,17 +100,25 @@ export default function JobsTable({ onlyActive = false }: JobsTableProps) {
   ];
 
   const jobsDict = useMemo(() => {
-    if (!isGPUInfoLoaded) return {};
-    if (jobs.length === 0) return {};
     let jd: { [key: string]: { name: string; jobs: Job[] } } = {};
-    gpuList.forEach(gpu => {
-      jd[`${gpu.index}`] = { name: `${gpu.name}`, jobs: [] };
-    });
     jd['Idle'] = { name: 'Idle', jobs: [] };
+
+    const queueKeys = new Set<string>();
+    queues.forEach(queue => {
+      queueKeys.add(`${queue.gpu_ids}`);
+    });
     jobs.forEach(job => {
-      const gpu = gpuList.find(gpu => job.gpu_ids?.split(',').includes(gpu.index.toString())) as GpuInfo;
-      const key = `${gpu?.index || '0'}`;
-      if (['queued', 'running', 'stopping'].includes(job.status) && key in jd) {
+      if (job.gpu_ids) {
+        queueKeys.add(job.gpu_ids);
+      }
+    });
+    queueKeys.forEach(queueKey => {
+      jd[queueKey] = { name: getQueueLabel(queueKey), jobs: [] };
+    });
+
+    jobs.forEach(job => {
+      const key = job.gpu_ids || 'Idle';
+      if (['queued', 'running', 'stopping'].includes(job.status) && key in jd && key !== 'Idle') {
         jd[key].jobs.push(job);
       } else {
         jd['Idle'].jobs.push(job);
@@ -125,9 +140,9 @@ export default function JobsTable({ onlyActive = false }: JobsTableProps) {
       }
     });
     return jd;
-  }, [jobs, queues, isGPUInfoLoaded]);
+  }, [jobs, queues]);
 
-  let isLoading = status === 'loading' || queueStatus === 'loading' || !isGPUInfoLoaded;
+  let isLoading = status === 'loading' || queueStatus === 'loading';
 
   // if job dict is populated, we are always loaded
   if (Object.keys(jobsDict).length > 0) isLoading = false;
@@ -150,7 +165,9 @@ export default function JobsTable({ onlyActive = false }: JobsTableProps) {
               >
                 <div className="flex items-center space-x-2 flex-1 py-2">
                   <h2 className="font-semibold text-gray-100">{jobsDict[gpuKey].name}</h2>
-                  <span className="px-2 py-0.5 bg-gray-700 rounded-full text-xs text-gray-300"># {queue?.gpu_ids}</span>
+                  {!LOCAL_QUEUE_KEYS.has(gpuKey) && queue?.gpu_ids && (
+                    <span className="px-2 py-0.5 bg-gray-700 rounded-full text-xs text-gray-300"># {queue.gpu_ids}</span>
+                  )}
                 </div>
                 <div className="text-sm text-gray-300 italic flex items-center">
                   {queue?.is_running ? (
