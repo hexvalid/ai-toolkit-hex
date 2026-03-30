@@ -360,9 +360,24 @@ class DiffusionTrainer(SDTrainer):
             self.update_status(
                 "running", f"Generating images - {img_num + 1}/{total_imgs}")
 
-    def sample(self, step=None, is_first=False, is_startup_sample=False, remote_base_only=False):
+    def sample(
+        self,
+        step=None,
+        is_first=False,
+        is_startup_sample=False,
+        remote_base_only=False,
+        lora_source_path=None,
+        cleanup_lora_source_path=True,
+    ):
         self.maybe_stop()
-        super().sample(step, is_first, is_startup_sample=is_startup_sample, remote_base_only=remote_base_only)
+        super().sample(
+            step,
+            is_first,
+            is_startup_sample=is_startup_sample,
+            remote_base_only=remote_base_only,
+            lora_source_path=lora_source_path,
+            cleanup_lora_source_path=cleanup_lora_source_path,
+        )
         self.maybe_stop()
 
     def before_waiting_for_background_samples(self, pending_batches: int):

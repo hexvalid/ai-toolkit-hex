@@ -17,6 +17,7 @@ from toolkit.dequantize import patch_dequantization_on_save
 from toolkit.accelerator import unwrap_model
 from optimum.quanto import freeze, QTensor
 from toolkit.util.quantize import quantize, get_qtype, quantize_model
+from toolkit.unloader import FakeTextEncoder
 
 from transformers import AutoProcessor, Mistral3ForConditionalGeneration
 from .src.model import Flux2, Flux2Params
@@ -124,32 +125,49 @@ class Flux2Model(BaseModel):
         tokenizer = AutoProcessor.from_pretrained(MISTRAL_PATH)
         return text_encoder, tokenizer
 
-    def load_model(self):
-        dtype = self.torch_dtype
-        self.print_and_status_update("Loading Flux2 model")
-        # will be updated if we detect a existing checkpoint in training folder
+    def _should_defer_text_encoder_load(self) -> bool:
+        return bool(self.model_config.model_kwargs.get("defer_text_encoder_load", False))
+
+    def _should_skip_text_encoder_startup_load(self) -> bool:
+        return bool(self.model_config.model_kwargs.get("skip_text_encoder_load", False))
+
+    def _should_defer_transformer_load(self) -> bool:
+        return bool(self.model_config.model_kwargs.get("defer_transformer_load", False))
+
+    def _make_placeholder_text_encoder(self):
+        return FakeTextEncoder(device=self.device_torch, dtype=self.torch_dtype), None
+
+    def _make_placeholder_transformer(self):
+        return FakeTextEncoder(device=self.device_torch, dtype=self.torch_dtype)
+
+    def should_delay_train_setup_until_after_dataset(self) -> bool:
+        return self._should_defer_transformer_load()
+
+    def _resolve_transformer_path(self):
         model_path = self.model_config.name_or_path
         transformer_path = model_path
 
-        self.print_and_status_update("Loading transformer")
-        with torch.device("meta"):
-            transformer = Flux2(self.get_flux2_params())
-
-        # use local path if provided
         if os.path.exists(os.path.join(transformer_path, self.flux2_te_filename)):
             transformer_path = os.path.join(transformer_path, self.flux2_te_filename)
 
         if not os.path.exists(transformer_path):
-            # assume it is from the hub
             transformer_path = huggingface_hub.hf_hub_download(
                 repo_id=model_path,
                 filename=self.flux2_te_filename,
                 token=HF_TOKEN,
             )
 
+        return transformer_path
+
+    def _load_transformer_module(self):
+        dtype = self.torch_dtype
+        self.print_and_status_update("Loading transformer")
+        with torch.device("meta"):
+            transformer = Flux2(self.get_flux2_params())
+
+        transformer_path = self._resolve_transformer_path()
         transformer_state_dict = load_file(transformer_path, device="cpu")
 
-        # cast to dtype
         for key in transformer_state_dict:
             transformer_state_dict[key] = transformer_state_dict[key].to(dtype)
 
@@ -158,7 +176,6 @@ class Flux2Model(BaseModel):
         transformer.to(self.quantize_device, dtype=dtype)
 
         if self.model_config.quantize:
-            # patch the state dict method
             patch_dequantization_on_save(transformer)
             self.print_and_status_update("Quantizing Transformer")
             quantize_model(self, transformer)
@@ -181,7 +198,76 @@ class Flux2Model(BaseModel):
             self.print_and_status_update("Moving transformer to CPU")
             transformer.to("cpu")
 
+        return transformer
+
+    def load_text_encoder_components(self):
+        has_real_text_encoder = False
+        if isinstance(self.text_encoder, list):
+            has_real_text_encoder = any(
+                encoder is not None and not isinstance(encoder, FakeTextEncoder)
+                for encoder in self.text_encoder
+            )
+        else:
+            has_real_text_encoder = (
+                self.text_encoder is not None
+                and not isinstance(self.text_encoder, FakeTextEncoder)
+            )
+
+        if has_real_text_encoder:
+            return
+
+        self.print_and_status_update("Lazy-loading text encoder")
         text_encoder, tokenizer = self.load_te()
+        self.pipeline.text_encoder = text_encoder
+        self.pipeline.tokenizer = tokenizer
+        self.text_encoder = [text_encoder]
+        self.tokenizer = [tokenizer]
+        text_encoder.to(self.device_torch)
+        text_encoder.requires_grad_(False)
+        text_encoder.eval()
+        flush()
+
+    def load_transformer_components(self):
+        if self.transformer is not None and not isinstance(self.transformer, FakeTextEncoder):
+            return
+
+        self.print_and_status_update("Lazy-loading transformer")
+        transformer = self._load_transformer_module()
+        self.pipeline.transformer = transformer
+        self.model = transformer
+        flush()
+
+    def load_deferred_components(self):
+        self.load_transformer_components()
+
+    def load_model(self):
+        dtype = self.torch_dtype
+        self.print_and_status_update("Loading Flux2 model")
+        # will be updated if we detect a existing checkpoint in training folder
+        model_path = self.model_config.name_or_path
+        if self._should_defer_transformer_load():
+            self.print_and_status_update("Deferring transformer load")
+            self.print_and_status_update(
+                "Transformer weights will be loaded after dataset cache preparation"
+            )
+            transformer = self._make_placeholder_transformer()
+        else:
+            transformer = self._load_transformer_module()
+
+        if self._should_skip_text_encoder_startup_load():
+            self.print_and_status_update("Skipping text encoder startup load")
+            self.print_and_status_update(
+                "Reusing cached blank prompt embeddings; startup text stack will stay unloaded"
+            )
+            text_encoder, tokenizer = self._make_placeholder_text_encoder()
+        elif self._should_defer_text_encoder_load():
+            self.print_and_status_update("Deferring text encoder load")
+            self.print_and_status_update(
+                "Text stack will be loaded only if prompt encoding is needed later"
+            )
+            text_encoder, tokenizer = self._make_placeholder_text_encoder()
+        else:
+            text_encoder, tokenizer = self.load_te()
 
         self.print_and_status_update("Loading VAE")
         vae_path = self.model_config.vae_path

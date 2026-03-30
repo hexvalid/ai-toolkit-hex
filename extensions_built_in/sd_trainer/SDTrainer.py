@@ -114,9 +114,87 @@ class SDTrainer(BaseSDTrainProcess):
         else:
             raise ValueError(f"Unknown guidance loss target type {type(self.train_config.guidance_loss_target)}")
 
+    def _get_blank_prompt_embed_cache_path(self) -> str:
+        return os.path.join(self.save_root, ".cache", "blank_prompt_embeds.safetensors")
 
-    def before_model_load(self):
-        pass
+    def _is_flux_family_model(self) -> bool:
+        arch = (self.model_config.arch or "").lower()
+        return self.model_config.is_flux or arch.startswith("flux")
+
+    def _can_use_blank_prompt_embed_fast_path(self) -> bool:
+        has_local_sample_prompts = (
+            not self.train_config.disable_sampling
+            and getattr(self.sample_config, "drawthings", None) is None
+            and self.sample_config is not None
+            and self.sample_config.samples is not None
+            and len(self.sample_config.samples) > 0
+        )
+        dataset_uses_controls = any(
+            (
+                getattr(dataset, "controls", None)
+                and len(getattr(dataset, "controls", [])) > 0
+            )
+            or getattr(dataset, "control_path_1", None) is not None
+            or getattr(dataset, "control_path_2", None) is not None
+            or getattr(dataset, "control_path_3", None) is not None
+            for dataset in self.dataset_configs
+        )
+
+        return (
+            self.device_torch.type == "mps"
+            and self._is_flux_family_model()
+            and self.train_config.unload_text_encoder
+            and not self.train_config.train_text_encoder
+            and not self.is_caching_text_embeddings
+            and self.trigger_word is None
+            and not self.train_config.diff_output_preservation
+            and not self.train_config.blank_prompt_preservation
+            and self.adapter_config is None
+            and self.embed_config is None
+            and not dataset_uses_controls
+            and not has_local_sample_prompts
+        )
+
+    def _has_cached_blank_prompt_embeds(self) -> bool:
+        return os.path.exists(self._get_blank_prompt_embed_cache_path())
+
+    def hook_before_model_load(self):
+        if self.model_config.model_kwargs is None:
+            self.model_config.model_kwargs = {}
+        self.model_config.model_kwargs.pop("skip_text_encoder_load", None)
+        self.model_config.model_kwargs.pop("defer_text_encoder_load", None)
+        self.model_config.model_kwargs.pop("defer_transformer_load", None)
+
+        if not self._can_use_blank_prompt_embed_fast_path():
+            return
+
+        blank_cache_path = self._get_blank_prompt_embed_cache_path()
+
+        if self._has_cached_blank_prompt_embeds():
+            self.model_config.model_kwargs["defer_transformer_load"] = True
+            self.model_config.model_kwargs["skip_text_encoder_load"] = True
+            print_acc(
+                f" - MPS fast path: reusing cached blank prompt embeds from {blank_cache_path}"
+            )
+            print_acc(
+                " - Startup text encoder load skipped because training only uses blank prompt embeds"
+            )
+            print_acc(
+                " - Startup transformer load deferred until after latent cache preparation"
+            )
+            return
+
+        self.model_config.model_kwargs["defer_transformer_load"] = True
+        self.model_config.model_kwargs["defer_text_encoder_load"] = True
+        print_acc(
+            " - MPS fast path: deferring text encoder load until blank prompt embeds are actually needed"
+        )
+        print_acc(
+            " - This keeps Qwen unloaded during latent cache verification/generation on the first run"
+        )
+        print_acc(
+            " - Transformer weights will also be loaded after latent cache preparation"
+        )
 
     def cache_sample_prompts(self):
         if self.train_config.disable_sampling:
@@ -251,24 +329,42 @@ class SDTrainer(BaseSDTrainProcess):
             # make sure model is on cpu for this part so we don't oom.
             self.sd.unet.to('cpu')
 
-        # cache unconditional embeds (blank prompt)
-        with torch.no_grad():
-            kwargs = {}
-            if self.sd.encode_control_in_text_embeddings:
-                # just do a blank image for unconditionals
-                control_image = torch.zeros((1, 3, 224, 224), device=self.sd.device_torch, dtype=self.sd.torch_dtype)
-                if self.sd.has_multiple_control_images:
-                    control_image = [control_image]
+        self.unconditional_embeds = None
+        if self.train_config.do_guidance_loss:
+            with torch.no_grad():
+                kwargs = {}
+                if self.sd.encode_control_in_text_embeddings:
+                    # just do a blank image for unconditionals
+                    control_image = torch.zeros((1, 3, 224, 224), device=self.sd.device_torch, dtype=self.sd.torch_dtype)
+                    if self.sd.has_multiple_control_images:
+                        control_image = [control_image]
 
-                kwargs['control_images'] = control_image
-            self.unconditional_embeds = self.sd.encode_prompt(
-                [self.train_config.unconditional_prompt],
-                long_prompts=self.do_long_prompts,
-                **kwargs
-            ).to(
-                self.device_torch,
-                dtype=self.sd.torch_dtype
-            ).detach()
+                    kwargs['control_images'] = control_image
+
+                if (
+                    self.train_config.unconditional_prompt == ""
+                    and self.cached_blank_embeds is None
+                    and self._can_use_blank_prompt_embed_fast_path()
+                    and os.path.exists(self._get_blank_prompt_embed_cache_path())
+                ):
+                    self.cached_blank_embeds = PromptEmbeds.load(self._get_blank_prompt_embed_cache_path())
+
+                if self.train_config.unconditional_prompt == "" and self.cached_blank_embeds is not None:
+                    self.unconditional_embeds = self.cached_blank_embeds.clone().detach().to(
+                        self.device_torch,
+                        dtype=self.sd.torch_dtype
+                    )
+                else:
+                    if hasattr(self.sd, "load_text_encoder_components"):
+                        self.sd.load_text_encoder_components()
+                    self.unconditional_embeds = self.sd.encode_prompt(
+                        [self.train_config.unconditional_prompt],
+                        long_prompts=self.do_long_prompts,
+                        **kwargs
+                    ).to(
+                        self.device_torch,
+                        dtype=self.sd.torch_dtype
+                    ).detach()
 
         if self.train_config.do_prior_divergence:
             self.do_prior_prediction = True
@@ -317,20 +413,54 @@ class SDTrainer(BaseSDTrainProcess):
                 if self.train_config.train_text_encoder:
                     raise ValueError("Cannot unload text encoder if training text encoder")
                 # cache embeddings
-                self.sd.text_encoder_to(self.device_torch)
+                print_acc(" - Stage detail: preparing text-side embeddings needed after text encoder unload")
+                blank_cache_path = self._get_blank_prompt_embed_cache_path()
+                can_use_fast_path = self._can_use_blank_prompt_embed_fast_path()
                 encode_kwargs = {}
                 if self.sd.encode_control_in_text_embeddings:
                     # just do a blank image for unconditionals
+                    print_acc(" - Control-image-aware text encoding is enabled; building blank control image for unconditional embeds")
                     control_image = torch.zeros((1, 3, 224, 224), device=self.sd.device_torch, dtype=self.sd.torch_dtype)
                     if self.sd.has_multiple_control_images:
                         control_image = [control_image]
                     encode_kwargs['control_images'] = control_image
-                self.cached_blank_embeds = self.sd.encode_prompt("", **encode_kwargs)
-                if self.trigger_word is not None:
-                    self.cached_trigger_embeds = self.sd.encode_prompt(self.trigger_word, **encode_kwargs)
+
+                reusing_cached_blank_embeds = can_use_fast_path and os.path.exists(blank_cache_path)
+
+                if reusing_cached_blank_embeds:
+                    print_acc(f" - Reusing cached blank prompt embedding from {blank_cache_path}")
+                    self.cached_blank_embeds = PromptEmbeds.load(blank_cache_path)
+                    print_acc(" - Blank prompt embedding restored from disk; text encoder forward pass skipped")
+                else:
+                    if hasattr(self.sd, "load_text_encoder_components") and can_use_fast_path:
+                        print_acc(" - Lazy-loading text encoder for one-time blank prompt embedding cache")
+                        self.sd.load_text_encoder_components()
+                    self.sd.text_encoder_to(self.device_torch)
+                    print_acc(f" - Text encoder moved to active device: {self.device_torch}")
+                    if self.trigger_word is None:
+                        print_acc(" - No trigger word configured; caching blank prompt embedding only")
+                    else:
+                        print_acc(f" - Caching blank prompt embedding and trigger embedding for: {self.trigger_word}")
+                    self.cached_blank_embeds = self.sd.encode_prompt("", **encode_kwargs)
+                    print_acc(" - Blank prompt embedding cached")
+                    if can_use_fast_path:
+                        self.cached_blank_embeds.save(blank_cache_path)
+                        print_acc(f" - Saved blank prompt embedding cache to {blank_cache_path}")
+                    if self.trigger_word is not None:
+                        self.cached_trigger_embeds = self.sd.encode_prompt(self.trigger_word, **encode_kwargs)
+                        print_acc(" - Trigger embedding cached")
                 if self.train_config.diff_output_preservation:
+                    print_acc(f" - Caching diff output preservation embedding for class: {self.train_config.diff_output_preservation_class}")
                     self.diff_output_preservation_embeds = self.sd.encode_prompt(self.train_config.diff_output_preservation_class)
 
+                if self.train_config.disable_sampling:
+                    print_acc(" - Sample prompt cache skipped because sampling is disabled")
+                elif getattr(self.sample_config, 'drawthings', None) is not None:
+                    print_acc(" - Sample prompt cache skipped because DrawThings remote sampling is enabled")
+                elif self.sample_config is not None and self.sample_config.samples is not None and len(self.sample_config.samples) > 0:
+                    print_acc(f" - Caching {len(self.sample_config.samples)} local sample prompt embedding pair(s)")
+                else:
+                    print_acc(" - No sample prompts to cache")
                 self.cache_sample_prompts()
 
                 print_acc("\n***** UNLOADING TEXT ENCODER *****")
@@ -346,12 +476,15 @@ class SDTrainer(BaseSDTrainProcess):
                 should_fully_unload_text_encoder = self.is_caching_text_embeddings or self.device_torch.type == "mps"
 
                 if should_fully_unload_text_encoder:
+                    print_acc(" - Fully unloading text encoder from the active model pipeline")
                     unload_text_encoder(self.sd)
                 else:
                     # todo once every model is tested to work, unload properly. Though, this will all be merged into one thing.
                     # keep legacy usage for now.
+                    print_acc(" - Moving text encoder back to CPU")
                     self.sd.text_encoder_to("cpu")
                 flush()
+                print_acc(" - Text encoder unload stage complete")
 
         if self.train_config.blank_prompt_preservation and self.cached_blank_embeds is None:
             # make sure we have this if not unloading

@@ -5,6 +5,7 @@ import json
 import math
 import os
 import random
+import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING, List, Dict, Union
 import traceback
@@ -1853,6 +1854,10 @@ class LatentCachingMixin:
 
     def cache_latents_all_latents(self: 'AiToolkitDataset'):
         with accelerator.main_process_first():
+            cache_started_at = time.monotonic()
+            total_files = len(self.file_list)
+            cache_hits = 0
+            cache_misses = 0
             print_acc(f"Caching latents for {self.dataset_path}")
             # cache all latents to disk
             to_disk = self.is_caching_latents_to_disk
@@ -1862,19 +1867,59 @@ class LatentCachingMixin:
                 print_acc(" - Saving latents to disk")
             if to_memory:
                 print_acc(" - Keeping latents in memory")
+            print_acc(" - Stage detail: image decode -> resize/crop -> VAE encode -> latent cache write (cache miss only)")
+
+            latent_paths = []
+            existing_cache_count = 0
+            for file_item in self.file_list:
+                latent_path = file_item.get_latent_path(recalculate=True)
+                latent_paths.append(latent_path)
+                if os.path.exists(latent_path):
+                    existing_cache_count += 1
+
+            if to_disk:
+                print_acc(
+                    f" - Existing latent cache files detected before verification: {existing_cache_count}/{total_files}"
+                )
+
+            if (
+                to_disk
+                and not to_memory
+                and existing_cache_count == total_files
+                and total_files > 0
+            ):
+                for file_item, latent_path in zip(self.file_list, latent_paths):
+                    file_item.is_caching_to_disk = True
+                    file_item.is_caching_to_memory = False
+                    file_item.latent_load_device = self.sd.device
+                    file_item._latent_path = latent_path
+                    file_item.is_latent_cached = True
+                elapsed_seconds = time.monotonic() - cache_started_at
+                print_acc(" - All latent cache files already exist; skipping VAE cache stage")
+                print_acc(
+                    f" - Latent cache summary: reused {total_files}/{total_files} cached file(s); no new VAE encode was needed "
+                    f"({elapsed_seconds:.1f}s)"
+                )
+                return
+
+            if getattr(self.sd, "device_torch", None) is not None and self.sd.device_torch.type == "mps":
+                print_acc(" - MPS note: latent cache uses the VAE, but already-loaded FLUX/Qwen weights can still pressure system RAM via unified memory")
             # move sd items to cpu except for vae
             self.sd.set_device_state_preset('cache_latents')
 
             # use tqdm to show progress
             i = 0
-            for file_item in tqdm(self.file_list, desc=f'Caching latents{" to disk" if to_disk else ""}'):
+            for file_item, latent_path in tqdm(
+                list(zip(self.file_list, latent_paths)),
+                desc=f'Caching latents{" to disk" if to_disk else ""}'
+            ):
                 file_item.is_caching_to_disk = to_disk
                 file_item.is_caching_to_memory = to_memory
                 file_item.latent_load_device = self.sd.device
-
-                latent_path = file_item.get_latent_path(recalculate=True)
+                file_item._latent_path = latent_path
                 # check if it is saved to disk already
                 if os.path.exists(latent_path):
+                    cache_hits += 1
                     if to_memory:
                         # load it into memory
                         state_dict = load_file(latent_path, device='cpu')
@@ -1884,6 +1929,7 @@ class LatentCachingMixin:
                         if 'audio_latent' in state_dict:
                             file_item._cached_audio_latent = state_dict['audio_latent'].to('cpu', dtype=self.sd.torch_dtype)
                 else:
+                    cache_misses += 1
                     # not saved to disk, calculate
                     # load the image first
                     file_item.load_and_process_image(self.transform, only_load_latents=True)
@@ -1955,6 +2001,17 @@ class LatentCachingMixin:
 
             # restore device state
             self.sd.restore_device_state()
+            elapsed_seconds = time.monotonic() - cache_started_at
+            if cache_misses == 0:
+                print_acc(
+                    f" - Latent cache summary: reused {cache_hits}/{total_files} cached file(s); no new VAE encode was needed "
+                    f"({elapsed_seconds:.1f}s)"
+                )
+            else:
+                print_acc(
+                    f" - Latent cache summary: reused {cache_hits}, generated {cache_misses} latent file(s) "
+                    f"({elapsed_seconds:.1f}s)"
+                )
 
 
 class TextEmbeddingFileItemDTOMixin:

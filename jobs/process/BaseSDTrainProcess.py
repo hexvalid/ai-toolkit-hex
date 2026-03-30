@@ -33,7 +33,7 @@ from toolkit.clip_vision_adapter import ClipVisionAdapter
 from toolkit.custom_adapter import CustomAdapter
 from toolkit.data_loader import get_dataloader_from_datasets, trigger_dataloader_setup_epoch
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
-from toolkit.drawthings import DrawThingsCancelledError, DrawThingsClient, DrawThingsConfig, DrawThingsGenerationRequest, convert_lora_for_drawthings, infer_drawthings_model_version
+from toolkit.drawthings import DrawThingsCancelledError, DrawThingsClient, DrawThingsConfig, DrawThingsGenerationRequest, convert_lora_for_drawthings, ensure_drawthings_converter_binary, get_drawthings_converter_binary_path, infer_drawthings_model_version
 from toolkit.ema import ExponentialMovingAverage
 from toolkit.embedding import Embedding
 from toolkit.image_utils import show_tensors, show_latents, reduce_contrast
@@ -477,6 +477,36 @@ class BaseSDTrainProcess(BaseTrainProcess):
             self.sample(self.step_num, is_startup_sample=True, remote_base_only=True)
             self._startup_baseline_sample_queued = True
 
+    def _should_prepare_drawthings_converter_before_model_load(self) -> bool:
+        if not self.accelerator.is_main_process:
+            return False
+        if self.train_config.disable_sampling:
+            return False
+        return getattr(self.sample_config, "drawthings", None) is not None
+
+    def _prepare_drawthings_converter_before_model_load(self):
+        if not self._should_prepare_drawthings_converter_before_model_load():
+            return
+
+        binary_path = get_drawthings_converter_binary_path()
+        print_acc("Stage: Draw Things converter preflight")
+        print_acc(" - Draw Things sampling/export is enabled for this job")
+        print_acc(" - Converter preflight runs before local model load so Swift build never starts mid-training")
+        print_acc(" - If the converter cannot be reused or built here, the job will fail before training starts")
+        print_acc(f" - Expected converter binary path: {binary_path}")
+        if binary_path.exists():
+            print_acc("Stage: Reusing Draw Things converter binary")
+            print_acc(f" - Using existing converter binary at {binary_path}")
+            return
+
+        print_acc("Stage: Building Draw Things converter")
+        print_acc(" - Converter binary missing; building before loading any local model weights")
+        built_binary_path = ensure_drawthings_converter_binary(
+            cancel_event=self._drawthings_sample_cancel_event,
+            log=print_acc,
+        )
+        print_acc(f" - Draw Things converter ready at {built_binary_path}")
+
     def _ensure_drawthings_sample_executor(self) -> concurrent.futures.ThreadPoolExecutor:
         if self._drawthings_sample_executor is None:
             safe_job_name = re.sub(r'[^A-Za-z0-9._-]+', '_', self.job.name).strip('._') or 'aitk_job'
@@ -648,6 +678,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         sample_tasks: List[tuple[int, GenerateImageConfig, str]],
         total_sample_count: int,
         local_lora_path: Optional[str],
+        cleanup_local_lora_path: bool,
         remote_lora_filename: Optional[str],
         inferred_model_version: Optional[str],
     ):
@@ -754,7 +785,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             print_acc(f"Cancelled background Draw Things sample batch for {step_label}; shutdown requested")
             return
         finally:
-            if local_lora_path is not None and os.path.exists(local_lora_path):
+            if cleanup_local_lora_path and local_lora_path is not None and os.path.exists(local_lora_path):
                 try:
                     os.remove(local_lora_path)
                 except OSError:
@@ -801,10 +832,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             save_image = save_image.convert('RGB')
         save_image.save(output_path)
 
-    def sample(self, step=None, is_first=False, is_startup_sample=False, remote_base_only=False):
-        if not self.accelerator.is_main_process:
-            return
-        self._raise_drawthings_sample_error_if_any()
+    def _build_sample_gen_img_config_list(self, step=None, is_first=False) -> tuple[str, list[GenerateImageConfig]]:
         sample_folder = os.path.join(self.save_root, 'samples')
         os.makedirs(sample_folder, exist_ok=True)
         gen_img_config_list = []
@@ -893,6 +921,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         # post process
         gen_img_config_list = self.post_process_generate_image_config_list(gen_img_config_list)
+        return sample_folder, gen_img_config_list
+
+    def _prepare_sample_tasks(self, step=None, is_first=False):
+        sample_folder, gen_img_config_list = self._build_sample_gen_img_config_list(step=step, is_first=is_first)
 
         total_sample_count = len(gen_img_config_list)
         sample_tasks: List[tuple[int, GenerateImageConfig, str]] = []
@@ -921,6 +953,122 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 skipped_existing_samples += 1
                 continue
             sample_tasks.append((sample_index, gen_img_config, signature))
+        return sample_folder, total_sample_count, sample_tasks, skipped_existing_samples
+
+    def _get_saved_network_checkpoint_path_for_step(self, step: int) -> Optional[str]:
+        if step is None:
+            return None
+        if self.network is None or self.is_fine_tuning or self.train_config.merge_network_on_save:
+            return None
+
+        step_suffix = f"_{str(step).zfill(9)}"
+        base_name = self.job.name
+        if self.named_lora:
+            base_name = f"{base_name}_LoRA"
+
+        patterns = [
+            f"{base_name}{step_suffix}.safetensors",
+            f"{base_name}{step_suffix}.pt",
+            f"{base_name}{step_suffix}",
+        ]
+        matches = []
+        for pattern in patterns:
+            matches.extend(glob.glob(os.path.join(self.save_root, pattern)))
+
+        matches = [match for match in matches if os.path.exists(match)]
+        if len(matches) == 0:
+            return None
+        matches.sort(key=os.path.getmtime, reverse=True)
+        return matches[0]
+
+    def _recover_missing_periodic_drawthings_samples_on_startup(self):
+        if not self.accelerator.is_main_process:
+            return
+        if self.train_config.disable_sampling:
+            return
+        if getattr(self.sample_config, "drawthings", None) is None:
+            return
+        sample_every = self.sample_config.sample_every
+        if sample_every is None or sample_every <= 0:
+            return
+        resume_step = self.step_num
+        if resume_step < sample_every:
+            return
+
+        periodic_steps = list(range(sample_every, resume_step + 1, sample_every))
+        if len(periodic_steps) == 0:
+            return
+
+        print_acc("Stage: Reconciling periodic Draw Things samples")
+        print_acc(
+            f" - Resume step: {resume_step} | sample_every: {sample_every} | "
+            f"candidate periodic sample steps: {len(periodic_steps)}"
+        )
+
+        queued_recovery_steps = 0
+        missing_without_checkpoint = 0
+        completed_steps = 0
+        for sample_step in periodic_steps:
+            _, total_sample_count, sample_tasks, _ = self._prepare_sample_tasks(step=sample_step, is_first=False)
+            completed_sample_count = total_sample_count - len(sample_tasks)
+
+            if len(sample_tasks) == 0:
+                completed_steps += 1
+                print_acc(
+                    f" - Step {sample_step}: samples already complete "
+                    f"({completed_sample_count}/{total_sample_count})"
+                )
+                continue
+
+            checkpoint_path = self._get_saved_network_checkpoint_path_for_step(sample_step)
+            if checkpoint_path is None:
+                missing_without_checkpoint += 1
+                print_acc(
+                    f" - Step {sample_step}: {completed_sample_count}/{total_sample_count} samples complete, "
+                    "but no matching saved LoRA checkpoint was found; cannot recover exact missing samples"
+                )
+                continue
+
+            print_acc(
+                f" - Step {sample_step}: {completed_sample_count}/{total_sample_count} samples complete; "
+                f"queueing {len(sample_tasks)} missing sample(s) from checkpoint {checkpoint_path}"
+            )
+            self.sample(
+                sample_step,
+                is_startup_sample=True,
+                remote_base_only=False,
+                lora_source_path=checkpoint_path,
+                cleanup_lora_source_path=False,
+            )
+            queued_recovery_steps += 1
+
+        print_acc(
+            " - Periodic sample reconciliation summary: "
+            f"{completed_steps} complete step(s), "
+            f"{queued_recovery_steps} recovered step(s), "
+            f"{missing_without_checkpoint} unrecoverable step(s)"
+        )
+
+    def sample(
+        self,
+        step=None,
+        is_first=False,
+        is_startup_sample=False,
+        remote_base_only=False,
+        lora_source_path: Optional[str] = None,
+        cleanup_lora_source_path: bool = True,
+    ):
+        if not self.accelerator.is_main_process:
+            return
+        self._raise_drawthings_sample_error_if_any()
+        if remote_base_only and lora_source_path is not None:
+            raise ValueError("Cannot provide `lora_source_path` when `remote_base_only` is enabled.")
+        sample_config = self.first_sample_config if is_first else self.sample_config
+
+        sample_folder, total_sample_count, sample_tasks, skipped_existing_samples = self._prepare_sample_tasks(
+            step=step,
+            is_first=is_first,
+        )
 
         step_label = "first sample" if is_first else ("final sample" if step is None else f"step {step}")
         if len(sample_tasks) == 0:
@@ -971,21 +1119,28 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         remote_lora_filename = None
         local_lora_path = None
+        should_cleanup_local_lora_path = cleanup_lora_source_path
 
         if not is_startup_sample:
             self._wait_for_previous_periodic_drawthings_sample(step)
 
         if not remote_base_only:
             remote_lora_filename = self._get_drawthings_remote_lora_filename()
-            local_lora_path = self._get_drawthings_local_lora_path(step, is_first, shared_gen_time)
+            if lora_source_path is not None:
+                local_lora_path = lora_source_path
+                should_cleanup_local_lora_path = cleanup_lora_source_path
+                print_acc(f"Reusing saved LoRA checkpoint for {step_label}: {local_lora_path}")
+            else:
+                local_lora_path = self._get_drawthings_local_lora_path(step, is_first, shared_gen_time)
+                should_cleanup_local_lora_path = True
 
-            if self.ema is not None:
-                self.ema.eval()
-            try:
-                self._export_current_lora_for_drawthings(local_lora_path)
-            finally:
                 if self.ema is not None:
-                    self.ema.train()
+                    self.ema.eval()
+                try:
+                    self._export_current_lora_for_drawthings(local_lora_path)
+                finally:
+                    if self.ema is not None:
+                        self.ema.train()
 
         future = self._ensure_drawthings_sample_executor().submit(
             self._run_drawthings_sample_batch,
@@ -996,6 +1151,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             sample_tasks=sample_tasks,
             total_sample_count=total_sample_count,
             local_lora_path=local_lora_path,
+            cleanup_local_lora_path=should_cleanup_local_lora_path,
             remote_lora_filename=remote_lora_filename,
             inferred_model_version=inferred_model_version,
         )
@@ -2231,12 +2387,405 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # set trainable params
         self.sd.adapter = self.adapter
 
+    def _should_delay_training_model_setup_until_after_dataset(self) -> bool:
+        return bool(
+            hasattr(self.sd, "should_delay_train_setup_until_after_dataset")
+            and self.sd.should_delay_train_setup_until_after_dataset()
+        )
+
+    def _prepare_loaded_model_components(self, model_stage_started_at: float):
+        if self.model_config.compile:
+            try:
+                torch.compile(self.sd.unet, dynamic=True, fullgraph=True, mode='max-autotune')
+            except Exception as e:
+                print_acc(f"Failed to compile model: {e}")
+                print_acc("Continuing without compilation")
+
+        self.sd.add_after_sample_image_hook(self.sample_step_hook)
+
+        dtype = get_torch_dtype(self.train_config.dtype)
+
+        unet = self.sd.unet
+        vae = self.sd.vae
+        text_encoder = self.sd.text_encoder
+
+        if self.train_config.xformers:
+            vae.enable_xformers_memory_efficient_attention()
+            unet.enable_xformers_memory_efficient_attention()
+            if isinstance(text_encoder, list):
+                for te in text_encoder:
+                    if hasattr(te, 'enable_xformers_memory_efficient_attention'):
+                        te.enable_xformers_memory_efficient_attention()
+
+        if self.train_config.attention_backend != 'native':
+            if hasattr(vae, 'set_attention_backend'):
+                vae.set_attention_backend(self.train_config.attention_backend)
+            if hasattr(unet, 'set_attention_backend'):
+                unet.set_attention_backend(self.train_config.attention_backend)
+            if isinstance(text_encoder, list):
+                for te in text_encoder:
+                    if hasattr(te, 'set_attention_backend'):
+                        te.set_attention_backend(self.train_config.attention_backend)
+            else:
+                if hasattr(text_encoder, 'set_attention_backend'):
+                    text_encoder.set_attention_backend(self.train_config.attention_backend)
+        if self.train_config.sdp:
+            torch.backends.cuda.enable_math_sdp(True)
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+
+        if self.train_config.gradient_checkpointing:
+            if hasattr(unet, 'enable_gradient_checkpointing'):
+                unet.enable_gradient_checkpointing()
+            elif hasattr(unet, 'gradient_checkpointing'):
+                unet.gradient_checkpointing = True
+            else:
+                print("Gradient checkpointing not supported on this model")
+            if isinstance(text_encoder, list):
+                for te in text_encoder:
+                    if hasattr(te, 'enable_gradient_checkpointing'):
+                        te.enable_gradient_checkpointing()
+                    if hasattr(te, "gradient_checkpointing_enable"):
+                        te.gradient_checkpointing_enable()
+            else:
+                if hasattr(text_encoder, 'enable_gradient_checkpointing'):
+                    text_encoder.enable_gradient_checkpointing()
+                if hasattr(text_encoder, "gradient_checkpointing_enable"):
+                    text_encoder.gradient_checkpointing_enable()
+
+        if self.sd.refiner_unet is not None:
+            self.sd.refiner_unet.to(self.device_torch, dtype=dtype)
+            self.sd.refiner_unet.requires_grad_(False)
+            self.sd.refiner_unet.eval()
+            if self.train_config.xformers:
+                self.sd.refiner_unet.enable_xformers_memory_efficient_attention()
+            if self.train_config.gradient_checkpointing:
+                self.sd.refiner_unet.enable_gradient_checkpointing()
+
+        if isinstance(text_encoder, list):
+            for te in text_encoder:
+                te.requires_grad_(False)
+                te.eval()
+        else:
+            text_encoder.requires_grad_(False)
+            text_encoder.eval()
+        unet.to(self.device_torch, dtype=dtype)
+        unet.requires_grad_(False)
+        unet.eval()
+        vae = vae.to(torch.device('cpu'), dtype=dtype)
+        vae.requires_grad_(False)
+        vae.eval()
+        if self.train_config.learnable_snr_gos:
+            self.snr_gos = LearnableSNRGamma(
+                self.sd.noise_scheduler, device=self.device_torch
+            )
+            path_to_load = os.path.join(self.save_root, 'learnable_snr.json')
+            if os.path.exists(path_to_load):
+                with open(path_to_load, 'r') as f:
+                    json_data = json.load(f)
+                    if 'offset' in json_data:
+                        self.snr_gos.offset_2.data = torch.tensor(json_data['offset'], device=self.device_torch)
+                    else:
+                        self.snr_gos.offset_1.data = torch.tensor(json_data['offset_1'], device=self.device_torch)
+                        self.snr_gos.offset_2.data = torch.tensor(json_data['offset_2'], device=self.device_torch)
+                    self.snr_gos.scale.data = torch.tensor(json_data['scale'], device=self.device_torch)
+                    self.snr_gos.gamma.data = torch.tensor(json_data['gamma'], device=self.device_torch)
+
+        self.hook_after_model_load()
+        flush()
+        print_acc(
+            f" - Base model components loaded in {time.monotonic() - model_stage_started_at:.1f}s"
+        )
+        return dtype, unet, text_encoder
+
+    def _setup_training_state_after_model_ready(self, dtype, text_encoder, unet):
+        params = []
+        if not self.is_fine_tuning:
+            if self.network_config is not None:
+                network_kwargs = self.network_config.network_kwargs
+                is_lycoris = False
+                is_lorm = self.network_config.type.lower() == 'lorm'
+                NetworkClass = LoRASpecialNetwork
+                if self.network_config.type.lower() == 'locon' or self.network_config.type.lower() == 'lycoris':
+                    NetworkClass = LycorisSpecialNetwork
+                    is_lycoris = True
+
+                if is_lorm:
+                    network_kwargs['ignore_if_contains'] = lorm_ignore_if_contains
+                    network_kwargs['parameter_threshold'] = lorm_parameter_threshold
+                    network_kwargs['target_lin_modules'] = LORM_TARGET_REPLACE_MODULE
+
+                if hasattr(self.sd, 'target_lora_modules'):
+                    network_kwargs['target_lin_modules'] = self.sd.target_lora_modules
+
+                self.network = NetworkClass(
+                    text_encoder=text_encoder,
+                    unet=self.sd.get_model_to_train(),
+                    lora_dim=self.network_config.linear,
+                    multiplier=1.0,
+                    alpha=self.network_config.linear_alpha,
+                    train_unet=self.train_config.train_unet,
+                    train_text_encoder=self.train_config.train_text_encoder,
+                    conv_lora_dim=self.network_config.conv,
+                    conv_alpha=self.network_config.conv_alpha,
+                    is_sdxl=self.model_config.is_xl or self.model_config.is_ssd,
+                    is_v2=self.model_config.is_v2,
+                    is_v3=self.model_config.is_v3,
+                    is_pixart=self.model_config.is_pixart,
+                    is_auraflow=self.model_config.is_auraflow,
+                    is_flux=self.model_config.is_flux,
+                    is_lumina2=self.model_config.is_lumina2,
+                    is_ssd=self.model_config.is_ssd,
+                    is_vega=self.model_config.is_vega,
+                    dropout=self.network_config.dropout,
+                    use_text_encoder_1=self.model_config.use_text_encoder_1,
+                    use_text_encoder_2=self.model_config.use_text_encoder_2,
+                    use_bias=is_lorm,
+                    is_lorm=is_lorm,
+                    network_config=self.network_config,
+                    network_type=self.network_config.type,
+                    transformer_only=self.network_config.transformer_only,
+                    is_transformer=self.sd.is_transformer,
+                    base_model=self.sd,
+                    **network_kwargs
+                )
+
+                self.network.force_to(self.device_torch, dtype=torch.float32)
+                self.sd.network = self.network
+                self.network._update_torch_multiplier()
+
+                self.network.apply_to(
+                    text_encoder,
+                    unet,
+                    self.train_config.train_text_encoder,
+                    self.train_config.train_unet
+                )
+
+                if self.model_config.quantize or self.model_config.layer_offloading:
+                    self.network.can_merge_in = False
+
+                if is_lorm:
+                    self.network.is_lorm = True
+                    self.sd.unet.to(self.sd.device, dtype=dtype)
+                    original_unet_param_count = count_parameters(self.sd.unet)
+                    self.network.setup_lorm()
+                    new_unet_param_count = original_unet_param_count - self.network.calculate_lorem_parameter_reduction()
+
+                    print_lorm_extract_details(
+                        start_num_params=original_unet_param_count,
+                        end_num_params=new_unet_param_count,
+                        num_replaced=len(self.network.get_all_modules()),
+                    )
+
+                self.network.prepare_grad_etc(text_encoder, unet)
+                flush()
+
+                config = {
+                    'text_encoder_lr': self.train_config.lr,
+                    'unet_lr': self.train_config.lr,
+                }
+                sig = inspect.signature(self.network.prepare_optimizer_params)
+                if 'default_lr' in sig.parameters:
+                    config['default_lr'] = self.train_config.lr
+                if 'learning_rate' in sig.parameters:
+                    config['learning_rate'] = self.train_config.lr
+                params_net = self.network.prepare_optimizer_params(
+                    **config
+                )
+
+                params += params_net
+
+                if self.train_config.gradient_checkpointing:
+                    self.network.enable_gradient_checkpointing()
+
+                lora_name = self.name
+                if self.named_lora:
+                    lora_name = f"{lora_name}_LoRA"
+
+                latest_save_path = self.get_latest_save_path(lora_name)
+                extra_weights = None
+                if latest_save_path is not None and not self.train_config.merge_network_on_save:
+                    print_acc(f"#### IMPORTANT RESUMING FROM {latest_save_path} ####")
+                    print_acc(f"Loading from {latest_save_path}")
+                    extra_weights = self.load_weights(latest_save_path)
+                    self.network.multiplier = 1.0
+
+                if self.network_config.layer_offloading:
+                    MemoryManager.attach(
+                        self.network,
+                        self.device_torch
+                    )
+
+            if self.embed_config is not None:
+                self.embedding = Embedding(
+                    sd=self.sd,
+                    embed_config=self.embed_config
+                )
+                latest_save_path = self.get_latest_save_path(self.embed_config.trigger)
+                if latest_save_path is not None:
+                    self.embedding.load_embedding_from_file(latest_save_path, self.device_torch)
+                    if self.embedding.step > 1:
+                        self.step_num = self.embedding.step
+                        self.start_step = self.step_num
+
+                params.append({
+                    'params': list(self.embedding.get_trainable_params()),
+                    'lr': self.train_config.embedding_lr
+                })
+
+                flush()
+
+            if self.decorator_config is not None:
+                self.decorator = Decorator(
+                    num_tokens=self.decorator_config.num_tokens,
+                    token_size=4096
+                )
+                latest_save_path = self.get_latest_save_path()
+                if latest_save_path is not None:
+                    state_dict = load_file(latest_save_path)
+                    self.decorator.load_state_dict(state_dict)
+                    self.load_training_state_from_metadata(latest_save_path)
+
+                params.append({
+                    'params': list(self.decorator.parameters()),
+                    'lr': self.train_config.lr
+                })
+
+                self.sd.decorator = self.decorator
+                self.decorator.to(self.device_torch, dtype=torch.float32)
+                self.decorator.train()
+
+                flush()
+
+            if self.adapter_config is not None:
+                self.setup_adapter()
+                if self.adapter_config.train:
+
+                    if isinstance(self.adapter, IPAdapter):
+                        adapter_param_groups = self.adapter.get_parameter_groups(self.train_config.adapter_lr)
+                        for group in adapter_param_groups:
+                            params.append(group)
+                    else:
+                        params.append({
+                            'params': list(self.adapter.parameters()),
+                            'lr': self.train_config.adapter_lr
+                        })
+
+                if self.train_config.gradient_checkpointing:
+                    self.adapter.enable_gradient_checkpointing()
+                flush()
+
+            params = self.load_additional_training_modules(params)
+
+        else:
+            self.sd.set_device_state(self.get_params_device_state_preset)
+
+            if len(params) == 0:
+                params = self.sd.prepare_optimizer_params(
+                    unet=self.train_config.train_unet,
+                    text_encoder=self.train_config.train_text_encoder,
+                    text_encoder_lr=self.train_config.lr,
+                    unet_lr=self.train_config.lr,
+                    default_lr=self.train_config.lr,
+                    refiner=self.train_config.train_refiner and self.sd.refiner_unet is not None,
+                    refiner_lr=self.train_config.refiner_lr,
+                )
+            if self.adapter_config is not None and self.adapter is None:
+                self.setup_adapter()
+        flush()
+        params = self.hook_add_extra_train_params(params)
+        self.params = params
+
+        if self.train_config.start_step is not None:
+            self.step_num = self.train_config.start_step
+            self.start_step = self.step_num
+
+        optimizer_type = self.train_config.optimizer.lower()
+
+        self.ensure_params_requires_grad(force=True)
+        optimizer = get_optimizer(self.params, optimizer_type, learning_rate=self.train_config.lr,
+                                  optimizer_params=self.train_config.optimizer_params)
+        self.optimizer = optimizer
+
+        if self.train_config.do_paramiter_swapping:
+            self.optimizer.enable_paramiter_swapping(self.train_config.paramiter_swapping_factor)
+
+        optimizer_state_paths = [
+            os.path.join(self.save_root, 'optimizer.pt'),
+            os.path.join(self.save_root, 'optimizer_prev.pt'),
+        ]
+        existing_optimizer_state_paths = [
+            path for path in optimizer_state_paths if os.path.exists(path)
+        ]
+        if existing_optimizer_state_paths:
+            previous_lrs = []
+            for group in optimizer.param_groups:
+                previous_lrs.append(group['lr'])
+
+            load_optimizer = True
+            if self.network is not None:
+                if self.network.did_change_weights:
+                    load_optimizer = False
+
+            if load_optimizer:
+                for optimizer_state_file_path in existing_optimizer_state_paths:
+                    try:
+                        print_acc(f"Loading optimizer state from {optimizer_state_file_path}")
+                        optimizer_state_dict = torch.load(optimizer_state_file_path, weights_only=True)
+                        optimizer.load_state_dict(optimizer_state_dict)
+                        del optimizer_state_dict
+                        flush()
+                        break
+                    except Exception as e:
+                        print_acc(f"Failed to load optimizer state from {optimizer_state_file_path}")
+                        print_acc(e)
+
+            print_acc(f"Updating optimizer LR from params")
+            if len(previous_lrs) > 0:
+                for i, group in enumerate(optimizer.param_groups):
+                    group['lr'] = previous_lrs[i]
+                    group['initial_lr'] = previous_lrs[i]
+
+        lr_scheduler_params = self.train_config.lr_scheduler_params
+
+        if 'max_iterations' not in lr_scheduler_params:
+            lr_scheduler_params['total_iters'] = self.train_config.steps
+
+        lr_scheduler = get_lr_scheduler(
+            self.train_config.lr_scheduler,
+            optimizer,
+            **lr_scheduler_params
+        )
+        self.lr_scheduler = lr_scheduler
+
+        self.last_save_step = self.step_num
+
+        if (
+            self.has_first_sample_requested
+            and self.step_num <= 1
+            and not self.train_config.disable_sampling
+            and not self._startup_first_sample_queued
+        ):
+            print_acc("Queueing first sample from first sample config")
+            self.sample(0, is_first=True, is_startup_sample=True)
+
+        if self.train_config.skip_first_sample or self.train_config.disable_sampling:
+            print_acc("Skipping first sample due to config setting")
+        elif (self.step_num <= 1 or self.train_config.force_first_sample) and not self._startup_baseline_sample_queued:
+            print_acc("Queueing baseline samples before training")
+            self.sample(self.step_num, is_startup_sample=True)
+
     def run(self):
         # torch.autograd.set_detect_anomaly(True)
         # run base process run
         BaseTrainProcess.run(self)
-        params = []
+        model_stage_started_at = time.monotonic()
 
+        print_acc("Stage: Loading training model stack")
+        print_acc(f" - Device: {self.device_torch} | dtype: {self.train_config.dtype}")
+        print_acc(" - Waiting for base model components first: transformer / text stack / VAE")
+
+        self._prepare_drawthings_converter_before_model_load()
         self._queue_remote_startup_samples_before_model_load()
 
         ### HOOK ###
@@ -2293,454 +2842,30 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.hook_after_sd_init_before_load()
         # run base sd process run
         self.sd.load_model()
-
-        # compile the model if needed
-        if self.model_config.compile:
-            try:
-                torch.compile(self.sd.unet, dynamic=True, fullgraph=True, mode='max-autotune')
-            except Exception as e:
-                print_acc(f"Failed to compile model: {e}")
-                print_acc("Continuing without compilation")
-
-        self.sd.add_after_sample_image_hook(self.sample_step_hook)
-
-        dtype = get_torch_dtype(self.train_config.dtype)
-
-        # model is loaded from BaseSDProcess
-        unet = self.sd.unet
-        vae = self.sd.vae
-        tokenizer = self.sd.tokenizer
-        text_encoder = self.sd.text_encoder
-        noise_scheduler = self.sd.noise_scheduler
-
-        if self.train_config.xformers:
-            vae.enable_xformers_memory_efficient_attention()
-            unet.enable_xformers_memory_efficient_attention()
-            if isinstance(text_encoder, list):
-                for te in text_encoder:
-                    # if it has it
-                    if hasattr(te, 'enable_xformers_memory_efficient_attention'):
-                        te.enable_xformers_memory_efficient_attention()
-
-        if self.train_config.attention_backend != 'native':
-            if hasattr(vae, 'set_attention_backend'):
-                vae.set_attention_backend(self.train_config.attention_backend)
-            if hasattr(unet, 'set_attention_backend'):
-                unet.set_attention_backend(self.train_config.attention_backend)
-            if isinstance(text_encoder, list):
-                for te in text_encoder:
-                    if hasattr(te, 'set_attention_backend'):
-                        te.set_attention_backend(self.train_config.attention_backend)
-            else:
-                if hasattr(text_encoder, 'set_attention_backend'):
-                    text_encoder.set_attention_backend(self.train_config.attention_backend)
-        if self.train_config.sdp:
-            torch.backends.cuda.enable_math_sdp(True)
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
-
-        # # check if we have sage and is flux
-        # if self.sd.is_flux:
-        #     # try_to_activate_sage_attn()
-        #     try:
-        #         from sageattention import sageattn
-        #         from toolkit.models.flux_sage_attn import FluxSageAttnProcessor2_0
-        #         model: FluxTransformer2DModel = self.sd.unet
-        #         # enable sage attention on each block
-        #         for block in model.transformer_blocks:
-        #             processor = FluxSageAttnProcessor2_0()
-        #             block.attn.set_processor(processor)
-        #         for block in model.single_transformer_blocks:
-        #             processor = FluxSageAttnProcessor2_0()
-        #             block.attn.set_processor(processor)
-
-        #     except ImportError:
-        #         print_acc("sage attention is not installed. Using SDP instead")
-
-        if self.train_config.gradient_checkpointing:
-            # if has method enable_gradient_checkpointing
-            if hasattr(unet, 'enable_gradient_checkpointing'):
-                unet.enable_gradient_checkpointing()
-            elif hasattr(unet, 'gradient_checkpointing'):
-                unet.gradient_checkpointing = True
-            else:
-                print("Gradient checkpointing not supported on this model")
-            if isinstance(text_encoder, list):
-                for te in text_encoder:
-                    if hasattr(te, 'enable_gradient_checkpointing'):
-                        te.enable_gradient_checkpointing()
-                    if hasattr(te, "gradient_checkpointing_enable"):
-                        te.gradient_checkpointing_enable()
-            else:
-                if hasattr(text_encoder, 'enable_gradient_checkpointing'):
-                    text_encoder.enable_gradient_checkpointing()
-                if hasattr(text_encoder, "gradient_checkpointing_enable"):
-                    text_encoder.gradient_checkpointing_enable()
-
-        if self.sd.refiner_unet is not None:
-            self.sd.refiner_unet.to(self.device_torch, dtype=dtype)
-            self.sd.refiner_unet.requires_grad_(False)
-            self.sd.refiner_unet.eval()
-            if self.train_config.xformers:
-                self.sd.refiner_unet.enable_xformers_memory_efficient_attention()
-            if self.train_config.gradient_checkpointing:
-                self.sd.refiner_unet.enable_gradient_checkpointing()
-
-        if isinstance(text_encoder, list):
-            for te in text_encoder:
-                te.requires_grad_(False)
-                te.eval()
+        delay_training_model_setup_until_after_dataset = self._should_delay_training_model_setup_until_after_dataset()
+        if delay_training_model_setup_until_after_dataset:
+            print_acc(" - MPS fast path: deferring trainable transformer setup until after dataset preparation")
         else:
-            text_encoder.requires_grad_(False)
-            text_encoder.eval()
-        unet.to(self.device_torch, dtype=dtype)
-        unet.requires_grad_(False)
-        unet.eval()
-        vae = vae.to(torch.device('cpu'), dtype=dtype)
-        vae.requires_grad_(False)
-        vae.eval()
-        if self.train_config.learnable_snr_gos:
-            self.snr_gos = LearnableSNRGamma(
-                self.sd.noise_scheduler, device=self.device_torch
+            dtype, unet, text_encoder = self._prepare_loaded_model_components(model_stage_started_at)
+            self._setup_training_state_after_model_ready(dtype, text_encoder, unet)
+            self._recover_missing_periodic_drawthings_samples_on_startup()
+
+        dataset_stage_started_at = time.monotonic()
+        print_acc("Stage: Preparing dataset")
+        if delay_training_model_setup_until_after_dataset:
+            print_acc(
+                f" - Dataset preparation is starting before transformer weight load "
+                f"({time.monotonic() - model_stage_started_at:.1f}s since launch)"
             )
-            # check to see if previous settings exist
-            path_to_load = os.path.join(self.save_root, 'learnable_snr.json')
-            if os.path.exists(path_to_load):
-                with open(path_to_load, 'r') as f:
-                    json_data = json.load(f)
-                    if 'offset' in json_data:
-                        # legacy
-                        self.snr_gos.offset_2.data = torch.tensor(json_data['offset'], device=self.device_torch)
-                    else:
-                        self.snr_gos.offset_1.data = torch.tensor(json_data['offset_1'], device=self.device_torch)
-                        self.snr_gos.offset_2.data = torch.tensor(json_data['offset_2'], device=self.device_torch)
-                    self.snr_gos.scale.data = torch.tensor(json_data['scale'], device=self.device_torch)
-                    self.snr_gos.gamma.data = torch.tensor(json_data['gamma'], device=self.device_torch)
-
-        self.hook_after_model_load()
-        flush()
-        if not self.is_fine_tuning:
-            if self.network_config is not None:
-                # TODO should we completely switch to LycorisSpecialNetwork?
-                network_kwargs = self.network_config.network_kwargs
-                is_lycoris = False
-                is_lorm = self.network_config.type.lower() == 'lorm'
-                # default to LoCON if there are any conv layers or if it is named
-                NetworkClass = LoRASpecialNetwork
-                if self.network_config.type.lower() == 'locon' or self.network_config.type.lower() == 'lycoris':
-                    NetworkClass = LycorisSpecialNetwork
-                    is_lycoris = True
-
-                if is_lorm:
-                    network_kwargs['ignore_if_contains'] = lorm_ignore_if_contains
-                    network_kwargs['parameter_threshold'] = lorm_parameter_threshold
-                    network_kwargs['target_lin_modules'] = LORM_TARGET_REPLACE_MODULE
-
-                # if is_lycoris:
-                #     preset = PRESET['full']
-                # NetworkClass.apply_preset(preset)
-
-                if hasattr(self.sd, 'target_lora_modules'):
-                    network_kwargs['target_lin_modules'] = self.sd.target_lora_modules
-
-                self.network = NetworkClass(
-                    text_encoder=text_encoder,
-                    unet=self.sd.get_model_to_train(),
-                    lora_dim=self.network_config.linear,
-                    multiplier=1.0,
-                    alpha=self.network_config.linear_alpha,
-                    train_unet=self.train_config.train_unet,
-                    train_text_encoder=self.train_config.train_text_encoder,
-                    conv_lora_dim=self.network_config.conv,
-                    conv_alpha=self.network_config.conv_alpha,
-                    is_sdxl=self.model_config.is_xl or self.model_config.is_ssd,
-                    is_v2=self.model_config.is_v2,
-                    is_v3=self.model_config.is_v3,
-                    is_pixart=self.model_config.is_pixart,
-                    is_auraflow=self.model_config.is_auraflow,
-                    is_flux=self.model_config.is_flux,
-                    is_lumina2=self.model_config.is_lumina2,
-                    is_ssd=self.model_config.is_ssd,
-                    is_vega=self.model_config.is_vega,
-                    dropout=self.network_config.dropout,
-                    use_text_encoder_1=self.model_config.use_text_encoder_1,
-                    use_text_encoder_2=self.model_config.use_text_encoder_2,
-                    use_bias=is_lorm,
-                    is_lorm=is_lorm,
-                    network_config=self.network_config,
-                    network_type=self.network_config.type,
-                    transformer_only=self.network_config.transformer_only,
-                    is_transformer=self.sd.is_transformer,
-                    base_model=self.sd,
-                    **network_kwargs
-                )
-
-
-                # todo switch everything to proper mixed precision like this
-                self.network.force_to(self.device_torch, dtype=torch.float32)
-                # give network to sd so it can use it
-                self.sd.network = self.network
-                self.network._update_torch_multiplier()
-
-                self.network.apply_to(
-                    text_encoder,
-                    unet,
-                    self.train_config.train_text_encoder,
-                    self.train_config.train_unet
-                )
-
-                # we cannot merge in if quantized
-                if self.model_config.quantize or self.model_config.layer_offloading:
-                    # todo find a way around this
-                    self.network.can_merge_in = False
-
-                if is_lorm:
-                    self.network.is_lorm = True
-                    # make sure it is on the right device
-                    self.sd.unet.to(self.sd.device, dtype=dtype)
-                    original_unet_param_count = count_parameters(self.sd.unet)
-                    self.network.setup_lorm()
-                    new_unet_param_count = original_unet_param_count - self.network.calculate_lorem_parameter_reduction()
-
-                    print_lorm_extract_details(
-                        start_num_params=original_unet_param_count,
-                        end_num_params=new_unet_param_count,
-                        num_replaced=len(self.network.get_all_modules()),
-                    )
-
-                self.network.prepare_grad_etc(text_encoder, unet)
-                flush()
-
-                # LyCORIS doesnt have default_lr
-                config = {
-                    'text_encoder_lr': self.train_config.lr,
-                    'unet_lr': self.train_config.lr,
-                }
-                sig = inspect.signature(self.network.prepare_optimizer_params)
-                if 'default_lr' in sig.parameters:
-                    config['default_lr'] = self.train_config.lr
-                if 'learning_rate' in sig.parameters:
-                    config['learning_rate'] = self.train_config.lr
-                params_net = self.network.prepare_optimizer_params(
-                    **config
-                )
-
-                params += params_net
-
-                if self.train_config.gradient_checkpointing:
-                    self.network.enable_gradient_checkpointing()
-
-                lora_name = self.name
-                # need to adapt name so they are not mixed up
-                if self.named_lora:
-                    lora_name = f"{lora_name}_LoRA"
-
-                latest_save_path = self.get_latest_save_path(lora_name)
-                extra_weights = None
-                if latest_save_path is not None and not self.train_config.merge_network_on_save:
-                    print_acc(f"#### IMPORTANT RESUMING FROM {latest_save_path} ####")
-                    print_acc(f"Loading from {latest_save_path}")
-                    extra_weights = self.load_weights(latest_save_path)
-                    self.network.multiplier = 1.0
-
-                if self.network_config.layer_offloading:
-                    MemoryManager.attach(
-                        self.network,
-                        self.device_torch
-                    )
-
-            if self.embed_config is not None:
-                # we are doing embedding training as well
-                self.embedding = Embedding(
-                    sd=self.sd,
-                    embed_config=self.embed_config
-                )
-                latest_save_path = self.get_latest_save_path(self.embed_config.trigger)
-                # load last saved weights
-                if latest_save_path is not None:
-                    self.embedding.load_embedding_from_file(latest_save_path, self.device_torch)
-                    if self.embedding.step > 1:
-                        self.step_num = self.embedding.step
-                        self.start_step = self.step_num
-
-                # self.step_num = self.embedding.step
-                # self.start_step = self.step_num
-                params.append({
-                    'params': list(self.embedding.get_trainable_params()),
-                    'lr': self.train_config.embedding_lr
-                })
-
-                flush()
-
-            if self.decorator_config is not None:
-                self.decorator = Decorator(
-                    num_tokens=self.decorator_config.num_tokens,
-                    token_size=4096 # t5xxl hidden size for flux
-                )
-                latest_save_path = self.get_latest_save_path()
-                # load last saved weights
-                if latest_save_path is not None:
-                    state_dict = load_file(latest_save_path)
-                    self.decorator.load_state_dict(state_dict)
-                    self.load_training_state_from_metadata(latest_save_path)
-
-                params.append({
-                    'params': list(self.decorator.parameters()),
-                    'lr': self.train_config.lr
-                })
-
-                # give it to the sd network
-                self.sd.decorator = self.decorator
-                self.decorator.to(self.device_torch, dtype=torch.float32)
-                self.decorator.train()
-
-                flush()
-
-            if self.adapter_config is not None:
-                self.setup_adapter()
-                if self.adapter_config.train:
-
-                    if isinstance(self.adapter, IPAdapter):
-                        # we have custom LR groups for IPAdapter
-                        adapter_param_groups = self.adapter.get_parameter_groups(self.train_config.adapter_lr)
-                        for group in adapter_param_groups:
-                            params.append(group)
-                    else:
-                        # set trainable params
-                        params.append({
-                            'params': list(self.adapter.parameters()),
-                            'lr': self.train_config.adapter_lr
-                        })
-
-                if self.train_config.gradient_checkpointing:
-                    self.adapter.enable_gradient_checkpointing()
-                flush()
-
-            params = self.load_additional_training_modules(params)
-
-        else:  # no network, embedding or adapter
-            # set the device state preset before getting params
-            self.sd.set_device_state(self.get_params_device_state_preset)
-
-            # params = self.get_params()
-            if len(params) == 0:
-                # will only return savable weights and ones with grad
-                params = self.sd.prepare_optimizer_params(
-                    unet=self.train_config.train_unet,
-                    text_encoder=self.train_config.train_text_encoder,
-                    text_encoder_lr=self.train_config.lr,
-                    unet_lr=self.train_config.lr,
-                    default_lr=self.train_config.lr,
-                    refiner=self.train_config.train_refiner and self.sd.refiner_unet is not None,
-                    refiner_lr=self.train_config.refiner_lr,
-                )
-            # we may be using it for prompt injections
-            if self.adapter_config is not None and self.adapter is None:
-                self.setup_adapter()
-        flush()
-        ### HOOK ###
-        params = self.hook_add_extra_train_params(params)
-        self.params = params
-        # self.params = []
-
-        # for param in params:
-        #     if isinstance(param, dict):
-        #         self.params += param['params']
-        #     else:
-        #         self.params.append(param)
-
-        if self.train_config.start_step is not None:
-            self.step_num = self.train_config.start_step
-            self.start_step = self.step_num
-
-        optimizer_type = self.train_config.optimizer.lower()
-
-        # esure params require grad
-        self.ensure_params_requires_grad(force=True)
-        optimizer = get_optimizer(self.params, optimizer_type, learning_rate=self.train_config.lr,
-                                  optimizer_params=self.train_config.optimizer_params)
-        self.optimizer = optimizer
-
-        # set it to do paramiter swapping
-        if self.train_config.do_paramiter_swapping:
-            # only works for adafactor, but it should have thrown an error prior to this otherwise
-            self.optimizer.enable_paramiter_swapping(self.train_config.paramiter_swapping_factor)
-
-        # check if it exists
-        optimizer_state_paths = [
-            os.path.join(self.save_root, 'optimizer.pt'),
-            os.path.join(self.save_root, 'optimizer_prev.pt'),
-        ]
-        existing_optimizer_state_paths = [
-            path for path in optimizer_state_paths if os.path.exists(path)
-        ]
-        if existing_optimizer_state_paths:
-            # try to load
-            # previous param groups
-            # previous_params = copy.deepcopy(optimizer.param_groups)
-            previous_lrs = []
-            for group in optimizer.param_groups:
-                previous_lrs.append(group['lr'])
-
-            load_optimizer = True
-            if self.network is not None:
-                if self.network.did_change_weights:
-                    # do not load optimizer if the network changed, it will result in
-                    # a double state that will oom.
-                    load_optimizer = False
-
-            if load_optimizer:
-                for optimizer_state_file_path in existing_optimizer_state_paths:
-                    try:
-                        print_acc(f"Loading optimizer state from {optimizer_state_file_path}")
-                        optimizer_state_dict = torch.load(optimizer_state_file_path, weights_only=True)
-                        optimizer.load_state_dict(optimizer_state_dict)
-                        del optimizer_state_dict
-                        flush()
-                        break
-                    except Exception as e:
-                        print_acc(f"Failed to load optimizer state from {optimizer_state_file_path}")
-                        print_acc(e)
-
-            # update the optimizer LR from the params
-            print_acc(f"Updating optimizer LR from params")
-            if len(previous_lrs) > 0:
-                for i, group in enumerate(optimizer.param_groups):
-                    group['lr'] = previous_lrs[i]
-                    group['initial_lr'] = previous_lrs[i]
-
-            # Update the learning rates if they changed
-            # optimizer.param_groups = previous_params
-
-        lr_scheduler_params = self.train_config.lr_scheduler_params
-
-        # make sure it had bare minimum
-        if 'max_iterations' not in lr_scheduler_params:
-            lr_scheduler_params['total_iters'] = self.train_config.steps
-
-        lr_scheduler = get_lr_scheduler(
-            self.train_config.lr_scheduler,
-            optimizer,
-            **lr_scheduler_params
-        )
-        self.lr_scheduler = lr_scheduler
-
-        self.last_save_step = self.step_num
-
-        if (
-            self.has_first_sample_requested
-            and self.step_num <= 1
-            and not self.train_config.disable_sampling
-            and not self._startup_first_sample_queued
-        ):
-            print_acc("Queueing first sample from first sample config")
-            self.sample(0, is_first=True, is_startup_sample=True)
-
-        if self.train_config.skip_first_sample or self.train_config.disable_sampling:
-            print_acc("Skipping first sample due to config setting")
-        elif (self.step_num <= 1 or self.train_config.force_first_sample) and not self._startup_baseline_sample_queued:
-            print_acc("Queueing baseline samples before training")
-            self.sample(self.step_num, is_startup_sample=True)
+        else:
+            print_acc(
+                f" - Full model stack is already loaded before dataset preparation starts "
+                f"({time.monotonic() - model_stage_started_at:.1f}s since launch)"
+            )
+        if self.device_torch.type == "mps":
+            print_acc(" - MPS note: unified memory can make system RAM usage jump during cache verification/generation")
+        if any(dataset.cache_latents or dataset.cache_latents_to_disk for dataset in self.dataset_configs):
+            print_acc(" - Waiting for latent cache verification/generation before the first training step")
 
         ### HOOk ###
         self.before_dataset_load()
@@ -2752,6 +2877,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                                                 self.sd)
 
         flush()
+        print_acc(
+            f" - Dataset preparation finished in {time.monotonic() - dataset_stage_started_at:.1f}s"
+        )
+
+        if delay_training_model_setup_until_after_dataset:
+            print_acc("Stage: Finalizing deferred training model stack")
+            print_acc(" - Loading transformer weights after dataset cache preparation")
+            if hasattr(self.sd, "load_deferred_components"):
+                self.sd.load_deferred_components()
+            dtype, unet, text_encoder = self._prepare_loaded_model_components(model_stage_started_at)
+            self._setup_training_state_after_model_ready(dtype, text_encoder, unet)
+            self._recover_missing_periodic_drawthings_samples_on_startup()
+
         ### HOOK ###
         self.hook_before_train_loop()
 
@@ -2782,6 +2920,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
             dataloader_iterator_reg = None
 
         # zero any gradients
+        optimizer = self.optimizer
         optimizer.zero_grad()
 
         self.lr_scheduler.step(self.step_num)

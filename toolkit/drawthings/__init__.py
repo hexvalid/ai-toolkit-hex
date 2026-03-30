@@ -7,7 +7,11 @@ from .client import (
     DrawThingsGenerationRequest,
     infer_drawthings_model_version,
 )
-from .converter import convert_lora_for_drawthings, ensure_drawthings_converter_binary
+from .converter import (
+    convert_lora_for_drawthings,
+    ensure_drawthings_converter_binary,
+    get_drawthings_converter_binary_path,
+)
 from .exceptions import DrawThingsCancelledError
 
 __all__ = [
@@ -20,5 +24,6 @@ __all__ = [
     "DrawThingsGenerationRequest",
     "convert_lora_for_drawthings",
     "ensure_drawthings_converter_binary",
+    "get_drawthings_converter_binary_path",
     "infer_drawthings_model_version",
 ]
