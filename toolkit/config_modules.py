@@ -75,13 +75,28 @@ class SampleItem:
         # only for models that support it, (qwen image edit 2509 for now)
         self.do_cfg_norm: bool = kwargs.get('do_cfg_norm', False)
 
+
+class DrawThingsSampleConfig:
+    def __init__(self, **kwargs):
+        self.server: str = kwargs.get('server', 'localhost')
+        self.port: int = int(kwargs.get('port', 7859))
+        self.use_tls: bool = kwargs.get('use_tls', True)
+        self.shared_secret: Optional[str] = kwargs.get('shared_secret', None)
+        if self.shared_secret == '':
+            self.shared_secret = None
+        self.model: Optional[str] = kwargs.get('model', None)
+        self.seed_mode: str = kwargs.get('seed_mode', 'ScaleAlike')
+        self.clip_skip: int = int(kwargs.get('clip_skip', 1))
+        self.lora_mode: str = kwargs.get('lora_mode', 'All')
+
+
 class SampleConfig:
     def __init__(self, **kwargs):
-        self.sampler: str = kwargs.get('sampler', 'ddpm')
+        self.sampler: str = kwargs.get('sampler', 'DPM++ 2M Karras')
         self.sample_every: int = kwargs.get('sample_every', 100)
         self.width: int = kwargs.get('width', 512)
         self.height: int = kwargs.get('height', 512)
-        self.neg = kwargs.get('neg', False)
+        self.neg = kwargs.get('neg', '')
         self.seed = kwargs.get('seed', 0)
         self.walk_seed = kwargs.get('walk_seed', False)
         self.guidance_scale = kwargs.get('guidance_scale', 7)
@@ -110,6 +125,7 @@ class SampleConfig:
         self.samples = [SampleItem(self, **item) for item in raw_samples]
         # only for models that support it, (qwen image edit 2509 for now)
         self.do_cfg_norm: bool = kwargs.get('do_cfg_norm', False)
+        self.drawthings = DrawThingsSampleConfig(**kwargs.get('drawthings', {}))
         
     @property
     def prompts(self):

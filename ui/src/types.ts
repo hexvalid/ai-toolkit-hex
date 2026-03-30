@@ -186,6 +186,34 @@ export interface SampleItem {
   ctrl_img_3?: string | null;
 }
 
+export interface DrawThingsSampleConfig {
+  server: string;
+  port: number;
+  use_tls: boolean;
+  shared_secret: string;
+  model: string;
+  seed_mode: string;
+  clip_skip: number;
+  lora_mode: string;
+}
+
+export interface DrawThingsServerModel {
+  file: string;
+  name?: string;
+  version?: string | null;
+  prefix?: string;
+}
+
+export interface DrawThingsCatalogResponse {
+  ok: boolean;
+  server: string;
+  port: number;
+  requestedUseTls: boolean;
+  resolvedUseTls: boolean;
+  files: number;
+  models: DrawThingsServerModel[];
+}
+
 export interface SampleConfig {
   sampler: string;
   sample_every: number;
@@ -200,6 +228,7 @@ export interface SampleConfig {
   sample_steps: number;
   num_frames: number;
   fps: number;
+  drawthings: DrawThingsSampleConfig;
 }
 
 export interface LoggingConfig {

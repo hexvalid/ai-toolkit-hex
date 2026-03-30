@@ -1,5 +1,5 @@
 'use client';
-import { useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   modelArchs,
   ModelArch,
@@ -9,16 +9,17 @@ import {
   jobTypeOptions,
 } from './options';
 import { defaultDatasetConfig } from './jobConfig';
-import { GroupedSelectOption, JobConfig, SelectOption } from '@/types';
+import { DrawThingsCatalogResponse, DrawThingsServerModel, GroupedSelectOption, JobConfig, SelectOption } from '@/types';
 import { objectCopy } from '@/utils/basic';
+import { apiClient } from '@/utils/api';
 import { TextInput, SelectInput, Checkbox, FormGroup, NumberInput, SliderInput } from '@/components/formInputs';
 import Card from '@/components/Card';
 import { X } from 'lucide-react';
 import AddSingleImageModal, { openAddImageModal } from '@/components/AddSingleImageModal';
-import SampleControlImage from '@/components/SampleControlImage';
 import { FlipHorizontal2, FlipVertical2 } from 'lucide-react';
 import { handleModelArchChange } from './utils';
 import { IoFlaskSharp } from 'react-icons/io5';
+import { drawThingsSamplerOptions, drawThingsSeedModeOptions, getDrawThingsModelOptions } from './drawThings';
 
 type Props = {
   jobConfig: JobConfig;
@@ -65,6 +66,72 @@ export default function SimpleJob({
   }, [modelArch, jobType]);
 
   const isVideoModel = !!(modelArch?.group === 'video');
+  const samplingDisabled = jobConfig.config.process[0].train.disable_sampling || false;
+  const drawThingsConfig = jobConfig.config.process[0].sample.drawthings;
+  const [drawThingsModels, setDrawThingsModels] = useState<DrawThingsServerModel[]>([]);
+  const [hasLoadedDrawThingsCatalog, setHasLoadedDrawThingsCatalog] = useState(false);
+  const [drawThingsProbeStatus, setDrawThingsProbeStatus] = useState<string | null>(null);
+  const [drawThingsProbeError, setDrawThingsProbeError] = useState<string | null>(null);
+  const [isTestingDrawThings, setIsTestingDrawThings] = useState(false);
+
+  useEffect(() => {
+    setDrawThingsModels([]);
+    setHasLoadedDrawThingsCatalog(false);
+    setDrawThingsProbeStatus(null);
+    setDrawThingsProbeError(null);
+  }, [drawThingsConfig.server, drawThingsConfig.port, drawThingsConfig.use_tls, drawThingsConfig.shared_secret]);
+
+  const drawThingsModelOptions = useMemo(() => {
+    return getDrawThingsModelOptions(drawThingsModels, drawThingsConfig.model || '');
+  }, [drawThingsModels, drawThingsConfig.model]);
+
+  const handleTestDrawThingsServer = async () => {
+    const server = (drawThingsConfig.server || '').trim();
+    const port = Number(drawThingsConfig.port);
+    if (server === '') {
+      setDrawThingsProbeStatus(null);
+      setDrawThingsProbeError('Draw Things server host or IP is required.');
+      return;
+    }
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      setDrawThingsProbeStatus(null);
+      setDrawThingsProbeError('Port must be an integer between 1 and 65535.');
+      return;
+    }
+
+    setIsTestingDrawThings(true);
+    setDrawThingsProbeStatus(null);
+    setDrawThingsProbeError(null);
+
+    try {
+      const response = await apiClient.post<DrawThingsCatalogResponse>('/api/drawthings/catalog', {
+        server,
+        port,
+        use_tls: Boolean(drawThingsConfig.use_tls),
+        shared_secret: drawThingsConfig.shared_secret || '',
+      });
+      const payload = response.data;
+      const modelCount = Array.isArray(payload.models) ? payload.models.length : 0;
+      const transportLabel = payload.resolvedUseTls ? 'TLS' : 'plaintext';
+
+      setDrawThingsModels(payload.models || []);
+      setHasLoadedDrawThingsCatalog(true);
+      setDrawThingsProbeStatus(
+        modelCount > 0
+          ? `Connected over ${transportLabel}. ${modelCount} model${modelCount === 1 ? '' : 's'} found.`
+          : `Connected over ${transportLabel}. The server responded, but it did not report any models.`,
+      );
+    } catch (error: any) {
+      const message =
+        error?.response?.data?.error || error?.message || 'Failed to connect to the Draw Things server.';
+      setDrawThingsModels([]);
+      setHasLoadedDrawThingsCatalog(false);
+      setDrawThingsProbeStatus(null);
+      setDrawThingsProbeError(message);
+    } finally {
+      setIsTestingDrawThings(false);
+    }
+  };
 
   const numTopCards = useMemo(() => {
     let count = 4; // job settings, model config, target config, save config
@@ -982,14 +1049,78 @@ export default function SimpleJob({
           </Card>
         </div>
         <div>
-          <Card title="Sample">
+          <Card title="Sample (Draw Things)">
+            <p className="text-xs text-gray-400 pb-4">
+              Samples are rendered through a Draw Things gRPC server. In-process local sampling has been removed.
+              Packaged `gRPCServerCLI` installs usually expect TLS on `localhost:7859`.
+            </p>
             <div
               className={
                 isVideoModel
-                  ? 'grid grid-cols-1 md:grid-cols-3 lg:grid-cols-5 gap-6'
-                  : 'grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6'
+                  ? 'grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-6'
+                  : 'grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-6'
               }
             >
+              <div>
+                <TextInput
+                  label="Server Host / IP"
+                  value={drawThingsConfig.server}
+                  onChange={value => setJobConfig(value, 'config.process[0].sample.drawthings.server')}
+                  placeholder="localhost"
+                  required={!samplingDisabled}
+                />
+                <NumberInput
+                  label="Port"
+                  value={drawThingsConfig.port}
+                  onChange={value => setJobConfig(value, 'config.process[0].sample.drawthings.port')}
+                  placeholder="7859"
+                  className="pt-2"
+                  min={1}
+                  max={65535}
+                  required={!samplingDisabled}
+                />
+                <TextInput
+                  label="Shared Secret"
+                  type="password"
+                  value={drawThingsConfig.shared_secret}
+                  onChange={value => setJobConfig(value, 'config.process[0].sample.drawthings.shared_secret')}
+                  placeholder="Optional"
+                  className="pt-2"
+                />
+                <Checkbox
+                  label="Use TLS"
+                  className="pt-4 pl-2"
+                  checked={drawThingsConfig.use_tls}
+                  onChange={value => setJobConfig(value, 'config.process[0].sample.drawthings.use_tls')}
+                />
+                <div className="pt-3">
+                  <button
+                    type="button"
+                    onClick={handleTestDrawThingsServer}
+                    disabled={isTestingDrawThings}
+                    className="text-gray-200 bg-gray-800 px-3 py-1 rounded-md hover:bg-gray-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {isTestingDrawThings ? 'Testing...' : 'Test & Load Models'}
+                  </button>
+                </div>
+                {drawThingsProbeStatus && <p className="pt-2 text-xs text-green-400">{drawThingsProbeStatus}</p>}
+                {drawThingsProbeError && <p className="pt-2 text-xs text-red-400">{drawThingsProbeError}</p>}
+              </div>
+              <div>
+                <SelectInput
+                  label="Model on Server"
+                  value={drawThingsConfig.model || ''}
+                  onChange={value => setJobConfig(value, 'config.process[0].sample.drawthings.model')}
+                  options={drawThingsModelOptions}
+                  disabled={drawThingsModelOptions.length === 0}
+                  required={!samplingDisabled}
+                />
+                <p className="pt-2 text-xs text-gray-400">
+                  {hasLoadedDrawThingsCatalog
+                    ? 'Loaded from the Draw Things server catalog.'
+                    : 'Click "Test & Load Models" to fetch the model list.'}
+                </p>
+              </div>
               <div>
                 <NumberInput
                   label="Sample Every"
@@ -1000,15 +1131,21 @@ export default function SimpleJob({
                   required
                 />
                 <SelectInput
-                  label="Sampler"
+                  label="Draw Things Sampler"
                   className="pt-2"
                   value={jobConfig.config.process[0].sample.sampler}
                   onChange={value => setJobConfig(value, 'config.process[0].sample.sampler')}
-                  options={[
-                    { value: 'flowmatch', label: 'FlowMatch' },
-                    { value: 'ddpm', label: 'DDPM' },
-                  ]}
+                  options={drawThingsSamplerOptions}
                 />
+                <SelectInput
+                  label="Seed Mode"
+                  className="pt-2"
+                  value={drawThingsConfig.seed_mode}
+                  onChange={value => setJobConfig(value, 'config.process[0].sample.drawthings.seed_mode')}
+                  options={drawThingsSeedModeOptions}
+                />
+              </div>
+              <div>
                 <NumberInput
                   label="Guidance Scale"
                   value={jobConfig.config.process[0].sample.guidance_scale}
@@ -1022,6 +1159,15 @@ export default function SimpleJob({
                   label="Sample Steps"
                   value={jobConfig.config.process[0].sample.sample_steps}
                   onChange={value => setJobConfig(value, 'config.process[0].sample.sample_steps')}
+                  placeholder="eg. 1"
+                  className="pt-2"
+                  min={1}
+                  required
+                />
+                <NumberInput
+                  label="Clip Skip"
+                  value={drawThingsConfig.clip_skip}
+                  onChange={value => setJobConfig(value, 'config.process[0].sample.drawthings.clip_skip')}
                   placeholder="eg. 1"
                   className="pt-2"
                   min={1}
@@ -1258,44 +1404,6 @@ export default function SimpleJob({
                           />
                         </div>
                       </div>
-                      {modelArch?.additionalSections?.includes('datasets.multi_control_paths') && (
-                        <FormGroup label="Control Images" className="pt-2 ml-4">
-                          <div className="grid grid-cols-1 md:grid-cols-3 gap-2 mt-2 mt-2">
-                            {['ctrl_img_1', 'ctrl_img_2', 'ctrl_img_3'].map((ctrlKey, ctrl_idx) => (
-                              <SampleControlImage
-                                key={ctrlKey}
-                                instruction={`Add Control Image ${ctrl_idx + 1}`}
-                                className=""
-                                src={sample[ctrlKey as keyof typeof sample] as string}
-                                onNewImageSelected={imagePath => {
-                                  if (!imagePath) {
-                                    let newSamples = objectCopy(jobConfig.config.process[0].sample.samples);
-                                    delete newSamples[i][ctrlKey as keyof typeof sample];
-                                    setJobConfig(newSamples, 'config.process[0].sample.samples');
-                                  } else {
-                                    setJobConfig(imagePath, `config.process[0].sample.samples[${i}].${ctrlKey}`);
-                                  }
-                                }}
-                              />
-                            ))}
-                          </div>
-                        </FormGroup>
-                      )}
-                      {modelArch?.additionalSections?.includes('sample.ctrl_img') && (
-                        <SampleControlImage
-                          className="mt-6 ml-4"
-                          src={sample.ctrl_img}
-                          onNewImageSelected={imagePath => {
-                            if (!imagePath) {
-                              let newSamples = objectCopy(jobConfig.config.process[0].sample.samples);
-                              delete newSamples[i].ctrl_img;
-                              setJobConfig(newSamples, 'config.process[0].sample.samples');
-                            } else {
-                              setJobConfig(imagePath, `config.process[0].sample.samples[${i}].ctrl_img`);
-                            }
-                          }}
-                        />
-                      )}
                     </div>
                     <div className="pb-4"></div>
                   </div>

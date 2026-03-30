@@ -190,6 +190,22 @@ export const SelectInput = (props: SelectInputProps) => {
         isDisabled={props.disabled}
         className="aitk-react-select-container"
         classNamePrefix="aitk-react-select"
+        styles={{
+          menu: base => ({
+            ...base,
+            minWidth: '100%',
+            width: 'max-content',
+            maxWidth: 'min(48rem, calc(100vw - 2rem))',
+          }),
+          menuList: base => ({
+            ...base,
+            overflowX: 'hidden',
+          }),
+          option: base => ({
+            ...base,
+            whiteSpace: 'nowrap',
+          }),
+        }}
         onChange={selected => {
           if (selected) {
             onChange((selected as { value: string }).value);

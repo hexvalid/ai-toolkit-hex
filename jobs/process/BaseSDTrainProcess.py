@@ -1,12 +1,15 @@
 import copy
+import concurrent.futures
 import glob
 import inspect
 import json
 import random
 import shutil
+import time
 from collections import OrderedDict
 import os
 import re
+import threading
 import traceback
 from typing import Union, List, Optional
 
@@ -28,6 +31,7 @@ from toolkit.clip_vision_adapter import ClipVisionAdapter
 from toolkit.custom_adapter import CustomAdapter
 from toolkit.data_loader import get_dataloader_from_datasets, trigger_dataloader_setup_epoch
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
+from toolkit.drawthings import DrawThingsClient, DrawThingsConfig, DrawThingsGenerationRequest, infer_drawthings_model_version
 from toolkit.ema import ExponentialMovingAverage
 from toolkit.embedding import Embedding
 from toolkit.image_utils import show_tensors, show_latents, reduce_contrast
@@ -41,6 +45,7 @@ from toolkit.network_mixins import Network
 from toolkit.optimizer import get_optimizer
 from toolkit.paths import CONFIG_ROOT
 from toolkit.progress_bar import ToolkitProgressBar
+from toolkit.prompt_utils import inject_trigger_into_prompt
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.sampler import get_sampler
 from toolkit.saving import save_t2i_from_diffusers, load_t2i_model, save_ip_adapter_from_diffusers, \
@@ -264,16 +269,261 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.current_boundary_index = 0
         self.steps_this_boundary = 0
         self.num_consecutive_oom = 0
+        self._drawthings_sample_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._drawthings_sample_futures: List[concurrent.futures.Future] = []
+        self._drawthings_sample_lock = threading.Lock()
+        self._drawthings_sample_error: Optional[Exception] = None
+        self._last_periodic_drawthings_sample_future: Optional[concurrent.futures.Future] = None
+        self._last_periodic_drawthings_sample_step: Optional[int] = None
+        self._startup_first_sample_queued = False
+        self._startup_baseline_sample_queued = False
 
     def post_process_generate_image_config_list(self, generate_image_config_list: List[GenerateImageConfig]):
         # override in subclass
         return generate_image_config_list
 
-    def sample(self, step=None, is_first=False):
+    def _get_drawthings_remote_lora_filename(self) -> str:
+        safe_job_name = re.sub(r'[^A-Za-z0-9._-]+', '_', self.job.name).strip('._')
+        if safe_job_name == '':
+            safe_job_name = 'aitk_job'
+        job_hash = hashlib.md5(self.save_root.encode('utf-8')).hexdigest()[:8]
+        return f"aitk_{safe_job_name}_{job_hash}_preview.safetensors"
+
+    def _get_drawthings_local_lora_path(self, step: Optional[int], is_first: bool, sample_time: int) -> str:
+        local_drawthings_dir = os.path.join(self.save_root, '.drawthings')
+        os.makedirs(local_drawthings_dir, exist_ok=True)
+        step_label = "first" if is_first else f"step_{'final' if step is None else str(step).zfill(9)}"
+        filename = f"{os.path.splitext(self._get_drawthings_remote_lora_filename())[0]}_{step_label}_{sample_time}.safetensors"
+        return os.path.join(local_drawthings_dir, filename)
+
+    def _should_queue_remote_startup_samples_before_model_load(self) -> bool:
+        if not self.accelerator.is_main_process:
+            return False
+        if self.train_config.disable_sampling:
+            return False
+        if self.train_config.start_step is not None and self.train_config.start_step > 1:
+            return False
+
+        resume_name = self.name
+        if self.named_lora:
+            resume_name = f"{resume_name}_LoRA"
+        latest_save_path = self.get_latest_save_path(resume_name)
+        return latest_save_path is None
+
+    def _queue_remote_startup_samples_before_model_load(self):
+        if not self._should_queue_remote_startup_samples_before_model_load():
+            return
+
+        if self.has_first_sample_requested:
+            print_acc("Queueing first sample before loading local model")
+            self.sample(0, is_first=True, is_startup_sample=True, remote_base_only=True)
+            self._startup_first_sample_queued = True
+
+        if self.train_config.skip_first_sample:
+            print_acc("Skipping startup baseline sample due to config setting")
+            return
+
+        if self.step_num <= 1 or self.train_config.force_first_sample:
+            print_acc("Queueing baseline samples before loading local model")
+            self.sample(self.step_num, is_startup_sample=True, remote_base_only=True)
+            self._startup_baseline_sample_queued = True
+
+    def _ensure_drawthings_sample_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        if self._drawthings_sample_executor is None:
+            safe_job_name = re.sub(r'[^A-Za-z0-9._-]+', '_', self.job.name).strip('._') or 'aitk_job'
+            self._drawthings_sample_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=f"drawthings-{safe_job_name}",
+            )
+        return self._drawthings_sample_executor
+
+    def _record_drawthings_sample_error(self, exc: Exception):
+        with self._drawthings_sample_lock:
+            if self._drawthings_sample_error is None:
+                self._drawthings_sample_error = exc
+
+    def _prune_completed_drawthings_sample_futures(self):
+        with self._drawthings_sample_lock:
+            remaining_futures: List[concurrent.futures.Future] = []
+            for future in self._drawthings_sample_futures:
+                if not future.done():
+                    remaining_futures.append(future)
+                    continue
+                try:
+                    future.result()
+                except Exception as exc:
+                    if self._drawthings_sample_error is None:
+                        self._drawthings_sample_error = exc
+            self._drawthings_sample_futures = remaining_futures
+
+    def _raise_drawthings_sample_error_if_any(self):
+        self._prune_completed_drawthings_sample_futures()
+        error = None
+        with self._drawthings_sample_lock:
+            if self._drawthings_sample_error is not None:
+                error = self._drawthings_sample_error
+                self._drawthings_sample_error = None
+        if error is not None:
+            raise RuntimeError(f"Background Draw Things sampling failed: {error}") from error
+
+    def before_waiting_for_background_samples(self, pending_batches: int):
+        pass
+
+    def wait_for_pending_drawthings_samples(self):
         if not self.accelerator.is_main_process:
             return
-        flush()
+
+        self._raise_drawthings_sample_error_if_any()
+
+        while True:
+            self._prune_completed_drawthings_sample_futures()
+            with self._drawthings_sample_lock:
+                pending_futures = list(self._drawthings_sample_futures)
+            if len(pending_futures) == 0:
+                break
+
+            self.before_waiting_for_background_samples(len(pending_futures))
+            print_acc(f"Waiting for {len(pending_futures)} background Draw Things sample batch(es) to finish")
+
+            for future in pending_futures:
+                try:
+                    future.result()
+                except Exception as exc:
+                    self._record_drawthings_sample_error(exc)
+                    break
+
+            self._raise_drawthings_sample_error_if_any()
+
+    def _shutdown_drawthings_sample_executor(self, wait: bool, cancel_futures: bool = False):
+        executor = self._drawthings_sample_executor
+        self._drawthings_sample_executor = None
+        if executor is None:
+            return
+        try:
+            executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+        except TypeError:
+            executor.shutdown(wait=wait)
+
+    def _wait_for_previous_periodic_drawthings_sample(self, next_step: Optional[int]):
+        future = self._last_periodic_drawthings_sample_future
+        if future is None:
+            return
+        if future.done():
+            self._raise_drawthings_sample_error_if_any()
+            return
+
+        previous_step = self._last_periodic_drawthings_sample_step
+        self.before_waiting_for_background_samples(1)
+        print_acc(
+            "Waiting for background Draw Things samples "
+            f"from step {previous_step} before queueing step {next_step}"
+        )
+        try:
+            future.result()
+        except Exception as exc:
+            self._record_drawthings_sample_error(exc)
+        self._raise_drawthings_sample_error_if_any()
+
+    def _run_drawthings_sample_batch(
+        self,
+        *,
+        step: Optional[int],
+        is_first: bool,
+        drawthings_config: DrawThingsConfig,
+        drawthings_sampler: str,
+        gen_img_config_list: List[GenerateImageConfig],
+        local_lora_path: Optional[str],
+        remote_lora_filename: Optional[str],
+        inferred_model_version: Optional[str],
+    ):
+        step_label = "first" if is_first else ("final" if step is None else str(step))
+        total_imgs = len(gen_img_config_list)
+        print_acc(f"Starting background Draw Things sample batch for {step_label} with {total_imgs} prompt(s)")
+
+        client = DrawThingsClient(drawthings_config)
+        try:
+            if local_lora_path is not None and remote_lora_filename is not None:
+                client.upload_file(local_lora_path, remote_lora_filename)
+
+            for i, gen_img_config in enumerate(gen_img_config_list):
+                generated_images = client.generate(
+                    DrawThingsGenerationRequest(
+                        prompt=gen_img_config.prompt,
+                        negative_prompt=gen_img_config.negative_prompt or '',
+                        width=gen_img_config.width,
+                        height=gen_img_config.height,
+                        steps=gen_img_config.num_inference_steps,
+                        guidance_scale=gen_img_config.guidance_scale,
+                        seed=gen_img_config.seed,
+                        sampler=drawthings_sampler,
+                        model_file=drawthings_config.model,
+                        lora_file=remote_lora_filename,
+                        lora_weight=gen_img_config.network_multiplier,
+                        seed_mode=drawthings_config.seed_mode,
+                        clip_skip=drawthings_config.clip_skip,
+                        lora_mode=drawthings_config.lora_mode,
+                        num_frames=gen_img_config.num_frames,
+                        fps=gen_img_config.fps,
+                        model_version=inferred_model_version,
+                    )
+                )
+
+                if len(generated_images) == 0:
+                    raise RuntimeError("Draw Things returned no images for a sample prompt.")
+
+                output_path = gen_img_config.get_image_path(i, total_imgs - 1)
+                self._save_drawthings_image(generated_images[0], output_path)
+
+            print_acc(f"Completed background Draw Things sample batch for {step_label}")
+        finally:
+            if local_lora_path is not None and os.path.exists(local_lora_path):
+                try:
+                    os.remove(local_lora_path)
+                except OSError:
+                    pass
+
+    def _export_current_lora_for_drawthings(self, export_path: str):
+        if self.network is None or self.network_config is None:
+            raise ValueError("Draw Things sampling currently requires an active LoRA network.")
+        if self.network_config.type not in ['lora', 'locon']:
+            raise ValueError(
+                f"Draw Things sampling currently supports LoRA-style networks only, got `{self.network_config.type}`."
+            )
+
+        os.makedirs(os.path.dirname(export_path), exist_ok=True)
+        self.update_training_metadata()
+        save_meta = get_meta_for_safetensors(copy.deepcopy(self.meta), self.job.name)
+
+        prev_multiplier = getattr(self.network, 'multiplier', None)
+        if prev_multiplier is not None:
+            self.network.multiplier = 1.0
+
+        try:
+            embedding_dict = self.embedding.state_dict() if self.embedding else None
+            self.network.save_weights(
+                export_path,
+                dtype=get_torch_dtype(self.save_config.dtype),
+                metadata=save_meta,
+                extra_state_dict=embedding_dict,
+            )
+        finally:
+            if prev_multiplier is not None:
+                self.network.multiplier = prev_multiplier
+
+    def _save_drawthings_image(self, image, output_path: str):
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        ext = os.path.splitext(output_path)[1].lower()
+        save_image = image
+        if ext in ['.jpg', '.jpeg'] and save_image.mode == 'RGBA':
+            save_image = save_image.convert('RGB')
+        save_image.save(output_path)
+
+    def sample(self, step=None, is_first=False, is_startup_sample=False, remote_base_only=False):
+        if not self.accelerator.is_main_process:
+            return
+        self._raise_drawthings_sample_error_if_any()
         sample_folder = os.path.join(self.save_root, 'samples')
+        os.makedirs(sample_folder, exist_ok=True)
         gen_img_config_list = []
 
         sample_config = self.first_sample_config if is_first else self.sample_config
@@ -314,9 +564,13 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     prompt, expand_token=True, add_if_not_present=False
                 )
             if self.trigger_word is not None:
-                prompt = self.sd.inject_trigger_into_prompt(
-                    prompt, self.trigger_word, add_if_not_present=False
-                )
+                sd_model = getattr(self, 'sd', None)
+                if sd_model is not None:
+                    prompt = sd_model.inject_trigger_into_prompt(
+                        prompt, self.trigger_word, add_if_not_present=False
+                    )
+                else:
+                    prompt = inject_trigger_into_prompt(prompt, self.trigger_word, add_if_not_present=False)
 
             extra_args = {}
             if self.adapter_config is not None and self.adapter_config.test_img_path is not None:
@@ -326,11 +580,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
             if sample_item.seed is not None:
                 current_seed = sample_item.seed
 
+            negative_prompt = sample_item.neg if isinstance(sample_item.neg, str) else ''
             gen_img_config_list.append(GenerateImageConfig(
                 prompt=prompt,  # it will autoparse the prompt
                 width=sample_item.width,
                 height=sample_item.height,
-                negative_prompt=sample_item.neg,
+                negative_prompt=negative_prompt,
                 seed=current_seed,
                 guidance_scale=sample_item.guidance_scale,
                 guidance_rescale=sample_config.guidance_rescale,
@@ -355,24 +610,84 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
         # post process
         gen_img_config_list = self.post_process_generate_image_config_list(gen_img_config_list)
+        legacy_sampler_map = {
+            'flowmatch': 'DPM++ 2M Karras',
+            'ddpm': 'DPM++ 2M Karras',
+        }
+        drawthings_sampler = legacy_sampler_map.get(sample_config.sampler, sample_config.sampler)
 
-        # if we have an ema, set it to validation mode
-        if self.ema is not None:
-            self.ema.eval()
+        drawthings_config = DrawThingsConfig(
+            server=sample_config.drawthings.server,
+            port=sample_config.drawthings.port,
+            use_tls=sample_config.drawthings.use_tls,
+            shared_secret=sample_config.drawthings.shared_secret,
+            model=sample_config.drawthings.model,
+            seed_mode=sample_config.drawthings.seed_mode,
+            clip_skip=sample_config.drawthings.clip_skip,
+            lora_mode=sample_config.drawthings.lora_mode,
+        )
 
-        # let adapter know we are sampling
-        if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
-            self.adapter.is_sampling = True
-        
-        # send to be generated
-        self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+        if drawthings_config.model is None or str(drawthings_config.model).strip() == '':
+            raise ValueError("Draw Things sampling requires `sample.drawthings.model` to be configured.")
 
-        
-        if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
-            self.adapter.is_sampling = False
+        shared_gen_time = int(time.time() * 1000)
+        for gen_img_config in gen_img_config_list:
+            gen_img_config.set_gen_time(shared_gen_time)
+            has_control_images = any([
+                gen_img_config.ctrl_img,
+                gen_img_config.ctrl_img_1,
+                gen_img_config.ctrl_img_2,
+                gen_img_config.ctrl_img_3,
+            ])
+            if has_control_images:
+                raise ValueError("Draw Things sampling does not yet support sample control images.")
+            if gen_img_config.adapter_image_path is not None:
+                raise ValueError("Draw Things sampling does not yet support adapter test images.")
+            if gen_img_config.num_frames > 1:
+                raise ValueError("Draw Things sampling currently supports image samples only.")
 
-        if self.ema is not None:
-            self.ema.train()
+        remote_lora_filename = None
+        local_lora_path = None
+
+        if not is_startup_sample:
+            self._wait_for_previous_periodic_drawthings_sample(step)
+
+        if not remote_base_only:
+            remote_lora_filename = self._get_drawthings_remote_lora_filename()
+            local_lora_path = self._get_drawthings_local_lora_path(step, is_first, shared_gen_time)
+
+            if self.ema is not None:
+                self.ema.eval()
+            try:
+                self._export_current_lora_for_drawthings(local_lora_path)
+            finally:
+                if self.ema is not None:
+                    self.ema.train()
+
+        future = self._ensure_drawthings_sample_executor().submit(
+            self._run_drawthings_sample_batch,
+            step=step,
+            is_first=is_first,
+            drawthings_config=drawthings_config,
+            drawthings_sampler=drawthings_sampler,
+            gen_img_config_list=gen_img_config_list,
+            local_lora_path=local_lora_path,
+            remote_lora_filename=remote_lora_filename,
+            inferred_model_version=infer_drawthings_model_version(self.model_config.arch),
+        )
+        with self._drawthings_sample_lock:
+            self._drawthings_sample_futures.append(future)
+            if not is_startup_sample:
+                self._last_periodic_drawthings_sample_future = future
+                self._last_periodic_drawthings_sample_step = step
+            pending_batches = len(self._drawthings_sample_futures)
+
+        step_label = "first sample" if is_first else ("final sample" if step is None else f"step {step}")
+        sample_mode_label = "base model" if remote_base_only else "LoRA"
+        print_acc(
+            f"Queued background Draw Things {sample_mode_label} sample batch for {step_label} "
+            f"with {len(gen_img_config_list)} prompt(s). Pending batches: {pending_batches}"
+        )
 
     def update_training_metadata(self):
         o_dict = OrderedDict({
@@ -486,7 +801,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
         pass
     
     def done_hook(self):
-        pass
+        if self.accelerator.is_main_process:
+            self.wait_for_pending_drawthings_samples()
+            self._shutdown_drawthings_sample_executor(wait=True)
+
+    def on_error(self, e: Exception):
+        self._shutdown_drawthings_sample_executor(wait=False, cancel_futures=True)
     
     def end_step_hook(self):
         pass
@@ -1524,6 +1844,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         BaseTrainProcess.run(self)
         params = []
 
+        self._queue_remote_startup_samples_before_model_load()
+
         ### HOOK ###
         self.hook_before_model_load()
         model_config_to_load = copy.deepcopy(self.model_config)
@@ -2003,6 +2325,23 @@ class BaseSDTrainProcess(BaseTrainProcess):
         )
         self.lr_scheduler = lr_scheduler
 
+        self.last_save_step = self.step_num
+
+        if (
+            self.has_first_sample_requested
+            and self.step_num <= 1
+            and not self.train_config.disable_sampling
+            and not self._startup_first_sample_queued
+        ):
+            print_acc("Queueing first sample from first sample config")
+            self.sample(0, is_first=True, is_startup_sample=True)
+
+        if self.train_config.skip_first_sample or self.train_config.disable_sampling:
+            print_acc("Skipping first sample due to config setting")
+        elif (self.step_num <= 1 or self.train_config.force_first_sample) and not self._startup_baseline_sample_queued:
+            print_acc("Queueing baseline samples before training")
+            self.sample(self.step_num, is_startup_sample=True)
+
         ### HOOk ###
         self.before_dataset_load()
         # load datasets if passed in the root process
@@ -2013,20 +2352,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                                                                 self.sd)
 
         flush()
-        self.last_save_step = self.step_num
         ### HOOK ###
         self.hook_before_train_loop()
-
-        if self.has_first_sample_requested and self.step_num <= 1 and not self.train_config.disable_sampling:
-            print_acc("Generating first sample from first sample config")
-            self.sample(0, is_first=True)
-
-        # sample first
-        if self.train_config.skip_first_sample or self.train_config.disable_sampling:
-            print_acc("Skipping first sample due to config setting")
-        elif self.step_num <= 1 or self.train_config.force_first_sample:
-            print_acc("Generating baseline samples before training")
-            self.sample(self.step_num)
         
         if self.accelerator.is_local_main_process:
             self.progress_bar = ToolkitProgressBar(
@@ -2265,17 +2592,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     if is_sample_step:
                         if self.progress_bar is not None:
                             self.progress_bar.pause()
-                        flush()
-                        # print above the progress bar
-                        if self.train_config.free_u:
-                            self.sd.pipeline.disable_freeu()
-                        self.sample(self.step_num)
-                        if self.train_config.unload_text_encoder:
-                            # make sure the text encoder is unloaded
-                            self.sd.text_encoder_to('cpu')
-                        flush()
-
-                        self.ensure_params_requires_grad()
+                        print_acc(f"\nQueueing background samples at step {self.step_num}")
+                        self.sample(self.step_num, is_startup_sample=False)
                         if self.progress_bar is not None:
                             self.progress_bar.unpause()
 
@@ -2340,6 +2658,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # update various steps
                 self.step_num = step + 1
                 self.grad_accumulation_step += 1
+                self._raise_drawthings_sample_error_if_any()
                 self.end_step_hook()
 
 
@@ -2352,11 +2671,12 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.train_config.free_u:
             self.sd.pipeline.disable_freeu()
         if not self.train_config.disable_sampling:
-            self.sample(self.step_num)
+            self.sample(self.step_num, is_startup_sample=False)
             self.logger.commit(step=self.step_num)
         print_acc("")
         if self.accelerator.is_main_process:
             self.save()
+            self.wait_for_pending_drawthings_samples()
             self.logger.finish()
         self.accelerator.end_training()
 

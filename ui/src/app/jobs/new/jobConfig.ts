@@ -1,4 +1,5 @@
 import { JobConfig, DatasetConfig, SliderConfig } from '@/types';
+import { defaultDrawThingsSampleConfig, drawThingsDefaultSampler } from './drawThings';
 
 export const defaultDatasetConfig: DatasetConfig = {
   folder_path: '/path/to/images/folder',
@@ -107,7 +108,7 @@ export const defaultJobConfig: JobConfig = {
           model_kwargs: {},
         },
         sample: {
-          sampler: 'flowmatch',
+          sampler: drawThingsDefaultSampler,
           sample_every: 250,
           width: 1024,
           height: 1024,
@@ -153,6 +154,9 @@ export const defaultJobConfig: JobConfig = {
           sample_steps: 25,
           num_frames: 1,
           fps: 1,
+          drawthings: {
+            ...defaultDrawThingsSampleConfig,
+          },
         },
       },
     ],
@@ -198,6 +202,26 @@ export const migrateJobConfig = (jobConfig: JobConfig): JobConfig => {
       log_every: 1,
       use_ui_logger: true,
     };
+  }
+
+  if (!jobConfig.config.process[0].sample.drawthings) {
+    jobConfig.config.process[0].sample.drawthings = {
+      ...defaultDrawThingsSampleConfig,
+    };
+  } else {
+    jobConfig.config.process[0].sample.drawthings = {
+      ...defaultDrawThingsSampleConfig,
+      ...jobConfig.config.process[0].sample.drawthings,
+    };
+  }
+
+  const legacySamplerMap: Record<string, string> = {
+    flowmatch: drawThingsDefaultSampler,
+    ddpm: drawThingsDefaultSampler,
+  };
+  const currentSampler = jobConfig.config.process[0].sample.sampler;
+  if (currentSampler in legacySamplerMap) {
+    jobConfig.config.process[0].sample.sampler = legacySamplerMap[currentSampler];
   }
   return jobConfig;
 };

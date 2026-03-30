@@ -279,13 +279,14 @@ class UITrainer(SDTrainer):
         self.update_status(
             "running", f"Generating images - {img_num + 1}/{total_imgs}")
 
-    def sample(self, step=None, is_first=False):
+    def sample(self, step=None, is_first=False, is_startup_sample=False, remote_base_only=False):
         self.maybe_stop()
-        total_imgs = len(self.sample_config.prompts)
-        self.update_status("running", f"Generating images - 0/{total_imgs}")
-        super().sample(step, is_first)
+        super().sample(step, is_first, is_startup_sample=is_startup_sample, remote_base_only=remote_base_only)
         self.maybe_stop()
-        self.update_status("running", "Training")
+
+    def before_waiting_for_background_samples(self, pending_batches: int):
+        super().before_waiting_for_background_samples(pending_batches)
+        self.update_status("running", f"Waiting for {pending_batches} background sample batch(es)")
 
     def save(self, step=None):
         self.maybe_stop()

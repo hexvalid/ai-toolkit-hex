@@ -120,6 +120,8 @@ class SDTrainer(BaseSDTrainProcess):
     def cache_sample_prompts(self):
         if self.train_config.disable_sampling:
             return
+        if getattr(self.sample_config, 'drawthings', None) is not None:
+            return
         if self.sample_config is not None and self.sample_config.samples is not None and len(self.sample_config.samples) > 0:
             # cache all the samples
             self.sd.sample_prompts_cache = []
