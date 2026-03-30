@@ -9,6 +9,7 @@ from PIL import Image
 from PIL.ImageOps import exif_transpose
 
 from toolkit.basic import flush
+from toolkit.device_utils import get_dataloader_kwargs
 from toolkit.models.RRDB import RRDBNet as ESRGAN, esrgan_safetensors_keys
 from safetensors.torch import save_file, load_file
 from torch.utils.data import DataLoader, ConcatDataset
@@ -157,11 +158,14 @@ class TrainESRGANProcess(BaseTrainProcess):
                 datasets.append(image_dataset)
 
             concatenated_dataset = ConcatDataset(datasets)
+            dataloader_kwargs = get_dataloader_kwargs(self.device)
+            if dataloader_kwargs.get('num_workers', 0) == 0:
+                dataloader_kwargs.pop('prefetch_factor', None)
             self.data_loader = DataLoader(
                 concatenated_dataset,
                 batch_size=self.batch_size,
                 shuffle=True,
-                num_workers=6
+                **dataloader_kwargs
             )
 
     def setup_vgg19(self):

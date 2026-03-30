@@ -11,6 +11,7 @@ from safetensors.torch import load_file
 from torch.utils.data import DataLoader, ConcatDataset
 
 from toolkit import train_tools
+from toolkit import device_utils
 from toolkit.basic import value_map, adain, get_mean_std
 from toolkit.clip_vision_adapter import ClipVisionAdapter
 from toolkit.config_modules import GenerateImageConfig
@@ -42,7 +43,7 @@ from torchvision.transforms import functional as TF
 
 
 def flush():
-    torch.cuda.empty_cache()
+    device_utils.empty_cache()
     gc.collect()
 
 
@@ -342,7 +343,9 @@ class SDTrainer(BaseSDTrainProcess):
                 print_acc("")
 
                 # unload the text encoder
-                if self.is_caching_text_embeddings:
+                should_fully_unload_text_encoder = self.is_caching_text_embeddings or self.device_torch.type == "mps"
+
+                if should_fully_unload_text_encoder:
                     unload_text_encoder(self.sd)
                 else:
                     # todo once every model is tested to work, unload properly. Though, this will all be merged into one thing.

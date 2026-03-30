@@ -77,9 +77,10 @@ import hashlib
 
 from toolkit.util.blended_blur_noise import get_blended_blur_noise
 from toolkit.util.get_model import get_model_class
+from toolkit import device_utils
 
 def flush():
-    torch.cuda.empty_cache()
+    device_utils.empty_cache()
     gc.collect()
 
 

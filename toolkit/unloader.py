@@ -1,7 +1,7 @@
 import gc
 import torch
 from toolkit.basic import flush
-from toolkit.device_utils import is_mps_available
+from typing import Optional
 from typing import TYPE_CHECKING
 
 
@@ -35,6 +35,28 @@ class FakeTextEncoder(torch.nn.Module):
         return self
 
 
+def _model_uses_mps(model: "BaseModel") -> bool:
+    return isinstance(getattr(model, "device_torch", None), torch.device) and model.device_torch.type == "mps"
+
+
+def _replace_text_encoder(
+    model: "BaseModel",
+    encoder: Optional[torch.nn.Module],
+    pipe_attr_name: Optional[str] = None,
+) -> FakeTextEncoder:
+    fake = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
+    if encoder is not None:
+        if _model_uses_mps(model):
+            encoder.to("meta")
+        else:
+            encoder.to("cpu")
+
+    if pipe_attr_name is not None and hasattr(model.pipeline, pipe_attr_name):
+        setattr(model.pipeline, pipe_attr_name, fake)
+
+    return fake
+
+
 def unload_text_encoder(model: "BaseModel"):
     # unload the text encoder in a way that will work with all models and will not throw errors
     # we need to make it appear as a text encoder module without actually having one so all
@@ -47,32 +69,22 @@ def unload_text_encoder(model: "BaseModel"):
 
             # the pipeline stores text encoders like text_encoder, text_encoder_2, text_encoder_3, etc.
             if hasattr(pipe, "text_encoder"):
-                te = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
+                te = _replace_text_encoder(model, pipe.text_encoder, "text_encoder")
                 text_encoder_list.append(te)
-                # if we are on mps, we don't want to move to cpu because it's unified memory
-                # and just freeing the reference is enough and faster
-                if not is_mps_available():
-                    pipe.text_encoder.to('cpu')
-                else:
-                    pipe.text_encoder.to('meta')
-                pipe.text_encoder = te
 
             i = 2
             while hasattr(pipe, f"text_encoder_{i}"):
-                te = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
+                encoder = getattr(pipe, f"text_encoder_{i}")
+                te = _replace_text_encoder(model, encoder, f"text_encoder_{i}")
                 text_encoder_list.append(te)
-                if is_mps_available():
-                    getattr(pipe, f"text_encoder_{i}").to('meta')
-                setattr(pipe, f"text_encoder_{i}", te)
                 i += 1
             model.text_encoder = text_encoder_list
         else:
             # only has a single text encoder
-            if is_mps_available():
-                model.text_encoder.to('meta')
-            model.text_encoder = FakeTextEncoder(device=model.device_torch, dtype=model.torch_dtype)
+            pipe_attr_name = "text_encoder" if hasattr(model.pipeline, "text_encoder") else None
+            model.text_encoder = _replace_text_encoder(model, model.text_encoder, pipe_attr_name)
 
-    if torch.backends.mps.is_available():
+    if _model_uses_mps(model) and hasattr(torch.mps, "empty_cache"):
         gc.collect()
         torch.mps.empty_cache()
 

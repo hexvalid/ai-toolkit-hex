@@ -68,11 +68,33 @@ export default function SimpleJob({
   const isVideoModel = !!(modelArch?.group === 'video');
   const samplingDisabled = jobConfig.config.process[0].train.disable_sampling || false;
   const drawThingsConfig = jobConfig.config.process[0].sample.drawthings;
+  const isMpsDevice = (jobConfig.config.process[0].device || '').startsWith('mps');
   const [drawThingsModels, setDrawThingsModels] = useState<DrawThingsServerModel[]>([]);
   const [hasLoadedDrawThingsCatalog, setHasLoadedDrawThingsCatalog] = useState(false);
   const [drawThingsProbeStatus, setDrawThingsProbeStatus] = useState<string | null>(null);
   const [drawThingsProbeError, setDrawThingsProbeError] = useState<string | null>(null);
   const [isTestingDrawThings, setIsTestingDrawThings] = useState(false);
+
+  useEffect(() => {
+    const optimizer = jobConfig.config.process[0].train.optimizer;
+    if (isMpsDevice && typeof optimizer === 'string' && optimizer.endsWith('8bit')) {
+      setJobConfig('adamw', 'config.process[0].train.optimizer');
+    }
+  }, [isMpsDevice, jobConfig.config.process[0].train.optimizer, setJobConfig]);
+
+  const optimizerOptions = useMemo(() => {
+    const baseOptions: SelectOption[] = [
+      { value: 'adamw', label: 'AdamW' },
+      { value: 'adafactor', label: 'Adafactor' },
+      { value: 'prodigy_plus_schedulefree', label: 'Prodigy Plus Schedule Free' },
+    ];
+
+    if (!isMpsDevice) {
+      baseOptions.splice(1, 0, { value: 'adamw8bit', label: 'AdamW8Bit' });
+    }
+
+    return baseOptions;
+  }, [isMpsDevice]);
 
   useEffect(() => {
     setDrawThingsModels([]);
@@ -556,12 +578,7 @@ export default function SimpleJob({
                   label="Optimizer"
                   value={jobConfig.config.process[0].train.optimizer}
                   onChange={value => setJobConfig(value, 'config.process[0].train.optimizer')}
-                  options={[
-                    { value: 'adamw', label: 'AdamW' },
-                    { value: 'adamw8bit', label: 'AdamW8Bit' },
-                    { value: 'adafactor', label: 'Adafactor' },
-                    { value: 'prodigy_plus_schedulefree', label: 'Prodigy Plus Schedule Free' },
-                  ]}
+                  options={optimizerOptions}
                 />
                 <NumberInput
                   label="Learning Rate"

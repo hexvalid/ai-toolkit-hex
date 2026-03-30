@@ -15,6 +15,7 @@ from torch import nn
 from torchvision.transforms import transforms
 
 from jobs.process import BaseTrainProcess
+from toolkit.device_utils import get_dataloader_kwargs
 from toolkit.image_utils import show_tensors
 from toolkit.kohya_model_util import load_vae, convert_diffusers_back_to_ldm
 from toolkit.data_loader import ImageDataset
@@ -207,11 +208,14 @@ class TrainVAEProcess(BaseTrainProcess):
                 datasets.append(image_dataset)
 
             concatenated_dataset = ConcatDataset(datasets)
+            dataloader_kwargs = get_dataloader_kwargs(self.device)
+            if dataloader_kwargs.get('num_workers', 0) == 0:
+                dataloader_kwargs.pop('prefetch_factor', None)
             self.data_loader = DataLoader(
                 concatenated_dataset,
                 batch_size=self.batch_size,
                 shuffle=True,
-                num_workers=16
+                **dataloader_kwargs
             )
 
     def remove_oldest_checkpoint(self):

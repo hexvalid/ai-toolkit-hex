@@ -120,7 +120,7 @@ class BlankNetwork:
 
 
 def flush():
-    torch.cuda.empty_cache()
+    device_utils.empty_cache()
     gc.collect()
 
 
@@ -1430,9 +1430,7 @@ class StableDiffusion:
 
                     if network is not None:
                         network.multiplier = gen_config.network_multiplier
-                    torch.manual_seed(gen_config.seed)
-                    torch.cuda.manual_seed(gen_config.seed)
-                    
+                    device_utils.manual_seed(gen_config.seed, self.device_torch)
                     generator = torch.manual_seed(gen_config.seed)
 
                     if self.adapter is not None and isinstance(self.adapter, ClipVisionAdapter) \
@@ -1731,7 +1729,7 @@ class StableDiffusion:
         del pipeline
         if refiner_pipeline is not None:
             del refiner_pipeline
-        torch.cuda.empty_cache()
+        device_utils.empty_cache(self.device_torch)
 
         # restore training state
         torch.set_rng_state(rng_state)

@@ -659,12 +659,12 @@ class LearnableSNRGamma:
     It will adapt to the dataset and attempt to adjust the snr multiplier to balance the loss over the timesteps
     """
     def __init__(self, noise_scheduler: Union['DDPMScheduler'], device=None):
-        self.device = device if device is not None else device_utils.get_device()
+        self.device = device_utils.get_optimal_device(device)
         self.noise_scheduler: Union['DDPMScheduler'] = noise_scheduler
-        self.offset_1 = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float32, device=device))
-        self.offset_2 = torch.nn.Parameter(torch.tensor(0.777, dtype=torch.float32, device=device))
-        self.scale = torch.nn.Parameter(torch.tensor(4.14, dtype=torch.float32, device=device))
-        self.gamma = torch.nn.Parameter(torch.tensor(2.03, dtype=torch.float32, device=device))
+        self.offset_1 = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float32, device=self.device))
+        self.offset_2 = torch.nn.Parameter(torch.tensor(0.777, dtype=torch.float32, device=self.device))
+        self.scale = torch.nn.Parameter(torch.tensor(4.14, dtype=torch.float32, device=self.device))
+        self.gamma = torch.nn.Parameter(torch.tensor(2.03, dtype=torch.float32, device=self.device))
         self.optimizer = torch.optim.AdamW([self.offset_1, self.offset_2, self.gamma, self.scale], lr=0.01)
         self.buffer = []
         self.max_buffer_size = 20

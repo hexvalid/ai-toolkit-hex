@@ -223,5 +223,11 @@ export const migrateJobConfig = (jobConfig: JobConfig): JobConfig => {
   if (currentSampler in legacySamplerMap) {
     jobConfig.config.process[0].sample.sampler = legacySamplerMap[currentSampler];
   }
+
+  const device = jobConfig.config.process[0].device || '';
+  const optimizer = jobConfig.config.process[0].train?.optimizer || '';
+  if (device.startsWith('mps') && optimizer.endsWith('8bit')) {
+    jobConfig.config.process[0].train.optimizer = 'adamw';
+  }
   return jobConfig;
 };

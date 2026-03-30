@@ -2,6 +2,7 @@ from typing import Union
 
 import torch
 import copy
+from toolkit.device_utils import get_optimal_device
 
 empty_preset = {
     'vae': {
@@ -32,7 +33,7 @@ empty_preset = {
 
 
 def get_train_sd_device_state_preset(
-        device: Union[str, torch.device],
+        device: Union[str, torch.device, None],
         train_unet: bool = False,
         train_text_encoder: bool = False,
         cached_latents: bool = False,
@@ -44,6 +45,7 @@ def get_train_sd_device_state_preset(
         unload_text_encoder: bool = False,
         require_grads: bool = True,
 ):
+    device = get_optimal_device(device)
     preset = copy.deepcopy(empty_preset)
     if not cached_latents:
         preset['vae']['device'] = device

@@ -26,6 +26,7 @@ from toolkit.prompt_utils import inject_trigger_into_prompt, PromptEmbeds, conca
 from toolkit.reference_adapter import ReferenceAdapter
 from toolkit.sd_device_states_presets import empty_preset
 from toolkit.train_tools import get_torch_dtype, apply_noise_offset
+from toolkit import device_utils
 import torch
 from toolkit.pipelines import CustomStableDiffusionXLPipeline
 from diffusers import StableDiffusionPipeline, StableDiffusionXLPipeline, T2IAdapter, DDPMScheduler, \
@@ -91,7 +92,7 @@ class BlankNetwork:
 
 
 def flush():
-    torch.cuda.empty_cache()
+    device_utils.empty_cache()
     gc.collect()
 
 
@@ -477,9 +478,7 @@ class BaseModel:
 
                     if network is not None:
                         network.multiplier = gen_config.network_multiplier
-                    torch.manual_seed(gen_config.seed)
-                    torch.cuda.manual_seed(gen_config.seed)
-
+                    device_utils.manual_seed(gen_config.seed, self.device_torch)
                     generator = torch.manual_seed(gen_config.seed)
 
                     if self.adapter is not None and isinstance(self.adapter, ClipVisionAdapter) \
@@ -670,7 +669,7 @@ class BaseModel:
 
         # clear pipeline and cache to reduce vram usage
         del pipeline
-        torch.cuda.empty_cache()
+        device_utils.empty_cache(self.device_torch)
 
         # restore training state
         torch.set_rng_state(rng_state)

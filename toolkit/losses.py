@@ -43,7 +43,7 @@ class ComparativeTotalVariation(torch.nn.Module):
 
 # Gradient penalty
 def get_gradient_penalty(critic, real, fake, device):
-    with device_utils.autocast():
+    with device_utils.autocast(device):
         real = real.float()
         fake = fake.float()
         alpha = torch.rand(real.size(0), 1, 1, 1).to(device).float()

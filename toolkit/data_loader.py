@@ -23,6 +23,7 @@ from toolkit.dataloader_mixins import CaptionMixin, BucketsMixin, LatentCachingM
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
 from toolkit.print import print_acc
 from toolkit.accelerator import get_accelerator
+from toolkit.device_utils import get_dataloader_kwargs
 
 import platform
 
@@ -666,13 +667,23 @@ def get_dataloader_from_datasets(
 
     # check if is caching latents
 
-    dataloader_kwargs = {}
-    
-    if is_native_windows():
+    device_kwargs = get_dataloader_kwargs()
+    dataloader_kwargs = device_kwargs.copy()
+
+    if is_native_windows() or device_kwargs.get('num_workers', 0) == 0:
         dataloader_kwargs['num_workers'] = 0
+        dataloader_kwargs['persistent_workers'] = False
+        dataloader_kwargs.pop('prefetch_factor', None)
     else:
-        dataloader_kwargs['num_workers'] = dataset_config_list[0].num_workers
-        dataloader_kwargs['prefetch_factor'] = dataset_config_list[0].prefetch_factor
+        config_workers = max(0, dataset_config_list[0].num_workers)
+        dataloader_kwargs['num_workers'] = config_workers
+        dataloader_kwargs['persistent_workers'] = config_workers > 0 and bool(
+            device_kwargs.get('persistent_workers', False)
+        )
+        if config_workers > 0 and dataset_config_list[0].prefetch_factor is not None:
+            dataloader_kwargs['prefetch_factor'] = dataset_config_list[0].prefetch_factor
+        else:
+            dataloader_kwargs.pop('prefetch_factor', None)
 
     if has_buckets:
         # make sure they all have buckets

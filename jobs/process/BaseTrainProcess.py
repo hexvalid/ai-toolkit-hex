@@ -8,6 +8,7 @@ import torch
 import yaml
 
 from jobs.process.BaseProcess import BaseProcess
+from toolkit import device_utils
 
 if TYPE_CHECKING:
     from jobs import TrainJob, BaseJob, ExtensionJob
@@ -33,9 +34,7 @@ class BaseTrainProcess(BaseProcess):
         self.training_seed = self.get_conf('training_seed', self.job.training_seed if hasattr(self.job, 'training_seed') else None)
         # if training seed is set, use it
         if self.training_seed is not None:
-            torch.manual_seed(self.training_seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed(self.training_seed)
+            device_utils.manual_seed(self.training_seed, self.get_conf('device', self.job.device if hasattr(self.job, 'device') else None))
             random.seed(self.training_seed)
 
         self.progress_bar = None
