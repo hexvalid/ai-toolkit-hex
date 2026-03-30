@@ -15,10 +15,11 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
     return NextResponse.json({ error: 'Job not found' }, { status: 404 });
   }
 
-  await prisma.job.update({
+  let updatedJob = await prisma.job.update({
     where: { id: jobID },
     data: {
       stop: true,
+      status: 'stopping',
       info: 'Stopping job...',
     },
   });
@@ -35,21 +36,25 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
       } else {
         process.kill(job.pid, 'SIGINT');
       }
-      // if it killed it, mark it stopped in the database
-      await prisma.job.update({
-        where: { id: jobID },
-        data: {
-          status: 'stopped',
-          info: 'Job stopped',
-        },
-      });
-    } catch (e) {
+    } catch (e: any) {
       // Process may have already exited — that's fine
       console.error('Error sending signal to process:', e);
+      if (e?.code === 'ESRCH') {
+        updatedJob = await prisma.job.update({
+          where: { id: jobID },
+          data: {
+            status: 'stopped',
+            stop: false,
+            return_to_queue: false,
+            pid: null,
+            info: 'Job stopped',
+          },
+        });
+      }
     }
   } else {
     console.warn(`No PID found for job ${jobID}, cannot send stop signal`);
   }
 
-  return NextResponse.json(job);
+  return NextResponse.json(updatedJob);
 }

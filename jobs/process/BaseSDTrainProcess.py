@@ -688,14 +688,21 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 client.upload_file(converted_lora_path, uploaded_remote_lora_filename)
                 print_acc(f"Uploaded Draw Things preview LoRA for batch {step_label}")
 
+            previous_generation_duration_seconds = None
             for sample_index, gen_img_config, signature in sample_tasks:
                 if self._drawthings_sample_cancel_event.is_set():
                     print_acc(f"Stopping background Draw Things sample batch for {step_label}; shutdown requested")
                     return
+                previous_duration_suffix = ""
+                if previous_generation_duration_seconds is not None:
+                    previous_duration_suffix = (
+                        f" (previous took {previous_generation_duration_seconds:.1f}s)"
+                    )
                 print_acc(
                     f"Requesting Draw Things preview image {sample_index + 1}/{total_imgs} "
-                    f"for batch {step_label}"
+                    f"for batch {step_label}{previous_duration_suffix}"
                 )
+                generation_started_at = time.monotonic()
                 generated_images = client.generate(
                     DrawThingsGenerationRequest(
                         prompt=gen_img_config.prompt,
@@ -717,6 +724,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         model_version=inferred_model_version,
                     )
                 )
+                previous_generation_duration_seconds = time.monotonic() - generation_started_at
 
                 if len(generated_images) == 0:
                     raise RuntimeError("Draw Things returned no images for a sample prompt.")

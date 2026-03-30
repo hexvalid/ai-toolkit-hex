@@ -57,7 +57,6 @@ def print_end_message(jobs_completed, jobs_failed):
         print_acc(f" - {failure_string}")
     print_acc("========================================")
 
-
 def main():
     parser = argparse.ArgumentParser()
 
@@ -106,26 +105,41 @@ def main():
         print_acc(f"Running {len(config_file_list)} job{'' if len(config_file_list) == 1 else 's'}")
 
     for config_file in config_file_list:
+        job = None
         try:
             job = get_job(config_file, args.name)
             job.run()
             job.cleanup()
             jobs_completed += 1
         except Exception as e:
+            process = None
+            if job is not None and getattr(job, "process", None):
+                process = job.process[0]
+                try:
+                    process.on_error(e)
+                except Exception as e2:
+                    print_acc(f"Error running on_error: {e2}")
+            if process is not None and getattr(process, "is_stopping", False):
+                if accelerator.is_main_process:
+                    print_acc(str(e) or "Job stopped")
+                break
             print_acc(f"Error running job: {e}")
             jobs_failed += 1
-            try:
-                job.process[0].on_error(e)
-            except Exception as e2:
-                print_acc(f"Error running on_error: {e2}")
             if not args.recover:
                 print_end_message(jobs_completed, jobs_failed)
                 raise e
         except KeyboardInterrupt as e:
-            try:
-                job.process[0].on_error(e)
-            except Exception as e2:
-                print_acc(f"Error running on_error: {e2}")
+            process = None
+            if job is not None and getattr(job, "process", None):
+                process = job.process[0]
+                try:
+                    process.on_error(e)
+                except Exception as e2:
+                    print_acc(f"Error running on_error: {e2}")
+            if process is not None and getattr(process, "is_stopping", False):
+                if accelerator.is_main_process:
+                    print_acc(str(e) or "Job stopped")
+                break
             if not args.recover:
                 print_end_message(jobs_completed, jobs_failed)
                 raise e

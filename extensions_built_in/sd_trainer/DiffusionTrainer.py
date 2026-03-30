@@ -139,6 +139,25 @@ class DiffusionTrainer(SDTrainer):
 
         return _check_return_to_queue()
 
+    def _finalize_job(self, status: AITK_Status, info: str):
+        if not self.is_ui_trainer or not self.accelerator.is_main_process:
+            return
+
+        final_step = getattr(self, "last_save_step", None)
+        if final_step is None:
+            final_step = getattr(self, "step_num", 0)
+
+        with self._db_connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute("BEGIN IMMEDIATE")
+            try:
+                cursor.execute(
+                    "UPDATE Job SET status = ?, info = ?, stop = 0, return_to_queue = 0, pid = NULL, step = ? WHERE id = ?",
+                    (status, info, final_step, self.job_id),
+                )
+            finally:
+                cursor.execute("COMMIT")
+
     def maybe_stop(self):
         if not self.is_ui_trainer:
             return
@@ -260,16 +279,22 @@ class DiffusionTrainer(SDTrainer):
             self._async_tasks.clear()
 
     def on_error(self, e: Exception):
-        if self.is_ui_trainer and (self.should_stop() or self.should_return_to_queue()):
+        stop_requested = self.is_ui_trainer and self.should_stop()
+        queue_requested = self.is_ui_trainer and not stop_requested and self.should_return_to_queue()
+        if stop_requested or queue_requested:
             self.is_stopping = True
             self._request_drawthings_sample_stop()
-            self._save_emergency_checkpoint("stop")
+            self._save_emergency_checkpoint("queue" if queue_requested else "stop")
         super(DiffusionTrainer, self).on_error(e)
         if self.is_ui_trainer:
             if self.accelerator.is_main_process and not self.is_stopping:
                 self.update_status("error", str(e))
-            self.update_db_key("step", self.last_save_step)
+                self.update_db_key("step", self.last_save_step)
             asyncio.run(self.wait_for_all_async())
+            if stop_requested:
+                self._finalize_job("stopped", "Job stopped")
+            elif queue_requested:
+                self._finalize_job("queued", "Job queued")
             self.thread_pool.shutdown(wait=True)
 
     def handle_timing_print_hook(self, timing_dict):

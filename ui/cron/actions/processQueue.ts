@@ -25,6 +25,7 @@ export default async function processQueue() {
         await prisma.job.update({
           where: { id: job.id },
           data: {
+            status: 'stopping',
             return_to_queue: true,
             info: 'Stopping job...',
           },
